@@ -1,0 +1,99 @@
+site_name: 学习笔记
+site_url: https://imperfect-jade.github.io/learning-notes/
+site_author: imperfect-jade
+site_description: 个人学习笔记，涵盖数据库、编程、系统工具与课程内容。
+
+repo_url: https://github.com/imperfect-jade/learning-notes
+repo_name: imperfect-jade/learning-notes
+edit_uri: edit/main/docs/
+
+theme:
+  name: material
+  language: zh
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.sections
+    - navigation.indexes
+    - navigation.top
+    - toc.follow
+    - search.highlight
+    - search.share
+    - content.code.copy
+    - content.code.select
+  palette:
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/weather-night
+        name: 切换到深色模式
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: teal
+      toggle:
+        icon: material/weather-sunny
+        name: 切换到浅色模式
+
+nav:
+  - 首页: index.md
+  - 数据库:
+      - CMU 15-445: database/cmu-15-445.md
+      - MiniSQL: database/minisql.md
+      - MySQL学习: database/mysql.md
+  - 编程与前端:
+      - Python学习: programming/python.md
+      - HTML学习: programming/html.md
+      - 并发编程: programming/concurrency.md
+  - 系统与工具:
+      - Linux学习: systems-tools/linux.md
+      - git使用教程: systems-tools/git.md
+      - markdown使用说明: systems-tools/markdown.md
+  - 课程笔记:
+      - 图像信息处理: courses/image-processing.md
+      - 宏观经济学: courses/macroeconomics.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+      toc_depth: 4
+  - pymdownx.arithmatex:
+      generic: true
+  - pymdownx.betterem:
+      smart_enable: all
+  - pymdownx.caret
+  - pymdownx.details
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.keys
+  - pymdownx.mark
+  - pymdownx.superfences
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+extra_javascript:
+  - javascripts/mathjax.js
+  - https://unpkg.com/mathjax@3/es5/tex-mml-chtml.js
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/imperfect-jade/learning-notes
+
+plugins:
+  - search:
+      lang:
+        - zh
+        - en
