@@ -63,6 +63,3 @@ git branch feature/payment
 1. 在仓库根目录创建 .gitignore 文件
 2. 在文件中添加需要忽略的文件 / 目录规则
 3. 将 .gitignore 本身提交到仓库
-
-连接指令 ssh -T -i C:/dev/ssh_keys/gitee_key git@gitee.com
-export GIT_SSH_COMMAND="ssh -i C:/dev/ssh_keys/gitee_key/id_ed25519"
