@@ -39,7 +39,7 @@
 }
 
 .md-nav--secondary .md-nav__item--collapsed > .md-nav {
-  display: none;
+  display: none !important;
 }
 
 .md-nav--secondary .md-nav__item--has-children > .md-nav__link {

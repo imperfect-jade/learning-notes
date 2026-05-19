@@ -1,5 +1,6 @@
 (function () {
-  let tocObserver;
+  let tocObservers = [];
+  let syncFrame;
 
   const childNavOf = (item) =>
     Array.from(item.children).find((child) =>
@@ -22,31 +23,57 @@
     }
   };
 
-  const collapseAllBranches = () => {
-    document
-      .querySelectorAll(".md-nav--secondary .md-nav__item--has-children")
+  const getTocs = () =>
+    Array.from(document.querySelectorAll(".md-nav--secondary"));
+
+  const lastActiveLink = (root) => {
+    const activeLinks = Array.from(
+      root.querySelectorAll(".md-nav__link--active")
+    );
+    return activeLinks[activeLinks.length - 1];
+  };
+
+  const linkByHash = (toc, hash) => {
+    if (!hash) {
+      return undefined;
+    }
+
+    return Array.from(toc.querySelectorAll(".md-nav__link")).find(
+      (link) => link.hash === hash
+    );
+  };
+
+  const collapseAllBranches = (toc) => {
+    toc
+      .querySelectorAll(".md-nav__item--has-children")
       .forEach((item) => setExpanded(item, false));
   };
 
-  const expandCurrentBranch = () => {
-    const activeLink = document.querySelector(
-      ".md-nav--secondary .md-nav__link--active"
-    );
+  const expandCurrentBranch = (toc) => {
+    const localActiveLink = lastActiveLink(toc);
+    const globalActiveLink = lastActiveLink(document);
+    const activeHash =
+      (localActiveLink && localActiveLink.hash) ||
+      (globalActiveLink && globalActiveLink.hash) ||
+      window.location.hash;
+    const activeLink = localActiveLink || linkByHash(toc, activeHash);
 
-    collapseAllBranches();
+    collapseAllBranches(toc);
 
     if (!activeLink) {
       return;
     }
 
     let item = activeLink.closest(".md-nav__item");
-    while (item && item.closest(".md-nav--secondary")) {
+    while (item && toc.contains(item)) {
       if (item.classList.contains("md-nav__item--has-children")) {
         setExpanded(item, true);
       }
 
       const parentNav = item.parentElement && item.parentElement.closest(".md-nav");
-      item = parentNav && parentNav.closest(".md-nav__item");
+      item = parentNav && parentNav !== toc
+        ? parentNav.closest(".md-nav__item")
+        : undefined;
     }
   };
 
@@ -70,30 +97,41 @@
     item.insertBefore(button, directLinkOf(item) || childNavOf(item));
   };
 
-  const enhanceToc = () => {
-    const toc = document.querySelector(".md-nav--secondary");
+  const syncAllTocs = () => {
+    getTocs().forEach(expandCurrentBranch);
+  };
 
-    if (tocObserver) {
-      tocObserver.disconnect();
-      tocObserver = undefined;
+  const scheduleSync = () => {
+    if (syncFrame) {
+      return;
     }
 
-    document
-      .querySelectorAll(".md-nav--secondary .md-nav__item")
-      .forEach((item) => {
-        if (!childNavOf(item)) {
-          return;
-        }
+    syncFrame = requestAnimationFrame(() => {
+      syncFrame = undefined;
+      syncAllTocs();
+    });
+  };
 
-        item.classList.add("md-nav__item--has-children");
-        addToggle(item);
-        setExpanded(item, false);
-      });
+  const enhanceToc = () => {
+    tocObservers.forEach((observer) => observer.disconnect());
+    tocObservers = [];
 
-    expandCurrentBranch();
+    getTocs().forEach((toc) => {
+      toc
+        .querySelectorAll(".md-nav__item")
+        .forEach((item) => {
+          if (!childNavOf(item)) {
+            return;
+          }
 
-    if (toc) {
-      tocObserver = new MutationObserver((mutations) => {
+          item.classList.add("md-nav__item--has-children");
+          addToggle(item);
+          setExpanded(item, false);
+        });
+
+      expandCurrentBranch(toc);
+
+      const tocObserver = new MutationObserver((mutations) => {
         const activeChanged = mutations.some(
           (mutation) =>
             mutation.type === "attributes" &&
@@ -102,7 +140,7 @@
         );
 
         if (activeChanged) {
-          expandCurrentBranch();
+          expandCurrentBranch(toc);
         }
       });
 
@@ -111,7 +149,9 @@
         attributeFilter: ["class"],
         subtree: true
       });
-    }
+
+      tocObservers.push(tocObserver);
+    });
   };
 
   if (typeof document$ !== "undefined") {
@@ -119,4 +159,7 @@
   } else {
     document.addEventListener("DOMContentLoaded", enhanceToc);
   }
+
+  window.addEventListener("scroll", scheduleSync, { passive: true });
+  window.addEventListener("hashchange", scheduleSync);
 })();
