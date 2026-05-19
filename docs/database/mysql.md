@@ -1,3 +1,5 @@
+# MySQL学习
+
 图形化界面教程
 [MySQL Workbench基本用法_mysql workbench怎么运行-CSDN博客](https://blog.csdn.net/potato123232/article/details/128528266?ops_request_misc=elastic_search_misc&request_id=590455ffd12ced8adc6035072fee919a&biz_id=0&utm_medium=distribute.pc_search_result.none-task-blog-2~all~top_positive~default-1-128528266-null-null.142%5Ev102%5Epc_search_result_base2&utm_term=mysql%20workbench%E4%BD%BF%E7%94%A8%E6%95%99%E7%A8%8B&spm=1018.2226.3001.4187)
 
@@ -9,11 +11,11 @@ JDBC教程
 大程教程
 https://blog.csdn.net/weixin_49614712/article/details/142899300?spm=1001.2014.3001.5502
 
-# 存储引擎
+## 存储引擎
 
 InnoDB是MySQL的默认存储引擎，支持事务、外键、行级锁。
 
-# 数据类型 
+## 数据类型
 
 - char(n) 指定长度为n的字符串
 - varchar(n) 最大长度为n的可变长度的字符串
@@ -23,9 +25,9 @@ InnoDB是MySQL的默认存储引擎，支持事务、外键、行级锁。
 - real, double precision 浮点数与双精度浮点数
 - float(n) 精度至少为n位数字的浮点数
 
-# DDL
-## 数据库操作
-### 查询
+## DDL
+### 数据库操作
+#### 查询
 
 查询所有数据库
 ```SQL
@@ -37,27 +39,27 @@ SHOW DTABASES;
 SELECT DATABASE();
 ```
 
-### 创建
+#### 创建
 
 创建数据库
 ```SQL
 CREATE DATABASE [IF NOT EXISTS] 数据库名 [DEFAULT CHARSET 字符集] [COLLATE 排序规则];
 ```
 
-### 删除
+#### 删除
 ```SQL
 DROP DATABASE [IF EXISTS] 数据库名;
 ```
 
-### 使用
+#### 使用
 
 ```SQL
 USE 数据库名;
 ```
 
-## 表操作
+### 表操作
 
-### 查询
+#### 查询
 
 查询当前数据库所有表
 ```SQL
@@ -74,7 +76,7 @@ DESC 表名;
 SHOW CREATE TABLE 表名;
 ```
 
-### 创建
+#### 创建
 
 创建表
 ```SQL
@@ -86,7 +88,7 @@ CREATE TABLE 表名(
 )[COMMENT 表注释];
 ```
 
-### 约束
+#### 约束
 
 约束表中的字段，保证正确性、有效性、完整性
 
@@ -131,7 +133,7 @@ foreign key (dept_name) references department on delete cascade on update cascad
 ```
 
 
-### 修改
+#### 修改
 
 添加字段
 ```SQL
@@ -190,7 +192,7 @@ ALTER TABLE 表名 ADD [CONSTRAINT 约束名] CHECK(约束条件);
 ALTER TABLE 子表名 ADD CONSTRAINT 外键名 FOREIGN KEY(外键字段名) REFERENCES 主表名(主表主键字段) ON DELETE CASCADE ON UPDATE CASCADE;
 ```
 
-### 删除
+#### 删除
 
 删除表
 ```SQL
@@ -204,9 +206,9 @@ TRUNCATE TABLE 表名;
 
 ---
 
-# DML
+## DML
 
-### 增
+#### 增
 
 给指定字段添加数据
 ```SQL
@@ -224,7 +226,7 @@ INSERT INTO 表名(字段名1,字段名2,……) VALUES(值1,值2,……),(值1,
 INSERT INTO 表名 VALUES(值1,值2,……),(值1,值2,……),(值1,值2,……);
 ```
 
-### 改
+#### 改
 
 修改数据
 ```SQL
@@ -238,9 +240,9 @@ DELETE FROM 表名 [WHERE 条件];
 
 ---
 
-# DQL
+## DQL
 
-## 查询
+### 查询
 ```SQL
 SELECT          # 4
 	字段列表
@@ -275,7 +277,7 @@ SELECT 字段1 [AS 别名1], 字段2 [AS 别名2] …… FROM 表名;
 SELECT DISTINCT 字段列表 FROM 表名;
 ```
 
-### 条件查询 WHERE
+#### 条件查询 WHERE
 
 | 比较运算符                 | 功能                          |
 | --------------------- | --------------------------- |
@@ -293,7 +295,7 @@ SELECT DISTINCT 字段列表 FROM 表名;
 | OR \|\|               | 或者                          |
 | NOT !                 | 非                           |
 
-### 集合运算
+#### 集合运算
 
 并集
 ```SQL
@@ -316,7 +318,7 @@ EXCEPT
 (SELECT course_id FROM section WHERE semester='Spring')
 ```
 
-### 连接查询
+#### 连接查询
 
 用于多表关联获取数据
 
@@ -338,7 +340,7 @@ SELECT e.name, d.dept_name FROM emp e JOIN dept d ON e.dept_id = d.id;
 SELECT e.name emp_name, m.name manager_name FROM emp e JOIN emp m ON e.manager_id = m.id;
 ```
 
-### 子查询
+#### 子查询
 
 嵌套在SQL中的查询语句
 子查询外部的语句可以是INSERT /UPDATE/DELETE/SELECT的任何一个
@@ -366,7 +368,7 @@ SELECT name FROM emp WHERE (salary, managerid) = (SELECT salary, managerid FROM 
 SELECT e.* d.* FROM (SELECT * FROM emp WHERE age > 30) e LEFT JOIN dept d ON e.dept_id = d.id;
 ```
 
-### IN与EXISTS的区别
+#### IN与EXISTS的区别
 
 IN和EXISTS都用于子查询中的条件判断，但执行逻辑和适用场景存在显著差异：
 
@@ -387,7 +389,7 @@ SELECT name AS manager_name FROM emp m
 WHERE EXISTS (SELECT 1 FROM emp e WHERE e.manager_id = m.id);
 ```
 
-### 公共表表达式（WITH）
+#### 公共表表达式（WITH）
 
 WITH子句用于定义**临时公共表表达式（CTE）**，可以将复杂的子查询逻辑封装为可复用的临时表，简化SQL语句的可读性和维护性，尤其适合多次使用相同子查询的场景，支持递归查询层级数据。
 
@@ -414,7 +416,7 @@ JOIN dept d ON das.dept_id = d.id
 WHERE das.avg_salary > 6000;
 ```
 
-### 聚合函数
+#### 聚合函数
 
 将一列数据作为一个整体，进行纵向计算
 
@@ -429,7 +431,7 @@ WHERE das.avg_salary > 6000;
 SELECT 聚合函数(字段名) FROM 表名;
 ```
 
-### 分组查询
+#### 分组查询
 
 ```SQL
 SELECT 字段列表 FROM 表名 [WHERE 条件] GROUP BY 分组字段名 [HAVING 分组后过滤条件];
@@ -443,7 +445,7 @@ SELECT 字段列表 FROM 表名 [WHERE 条件] GROUP BY 分组字段名 [HAVING 
 select workaddress, count(*) address_count from emp where age<45 group by workaddress having address_count >= 3;
 ```
 
-### 排序查询
+#### 排序查询
 
 ```SQL
 SELECT 字段列表 FROM 表名 ORDER BY 字段名1 排序方式1， 字段名2 排序方式2;
@@ -454,7 +456,7 @@ SELECT 字段列表 FROM 表名 ORDER BY 字段名1 排序方式1， 字段名2 
 select * from emp order by age asc, entrydate desc;
 ```
 
-### 分页查询
+#### 分页查询
 
 ```SQL
 SELECT 字段列表 FROM 表名 LIMIT 起始索引, 查询记录数;
@@ -463,8 +465,8 @@ SELECT 字段列表 FROM 表名 LIMIT 起始索引, 查询记录数;
 
 ---
 
-# DCL
-## 管理用户
+## DCL
+### 管理用户
 
 查询用户
 ```SQL
@@ -487,7 +489,7 @@ ALTER USER '用户名'@'主机名' IDENTIFIED WITH mysql_native_password BY '新
 DROP USER '用户名'@'主机名';
 ```
 
-## 权限控制
+### 权限控制
 
 | 权限                 | 说明         |
 | ------------------ | ---------- |
@@ -517,9 +519,9 @@ REVOKE 权限列表 ON 数据库名.表名 FROM '用户名'@'主机名';
 
 ---
 
-# 函数
+## 函数
 
-## 字符串函数
+### 字符串函数
 
 | 函数                         | 功能                    |
 | -------------------------- | --------------------- |
@@ -534,7 +536,7 @@ REVOKE 权限列表 ON 数据库名.表名 FROM '用户名'@'主机名';
 SELECT CONCAT(name, ' - ', dept_name) AS emp_info FROM emp;
 ```
 
-## 数值函数
+### 数值函数
 
 | 函数         | 功能            |
 | ---------- | ------------- |
@@ -544,7 +546,7 @@ SELECT CONCAT(name, ' - ', dept_name) AS emp_info FROM emp;
 | RAND()     | 返回0~1的随机数     |
 | ROUND(x,y) | 对x四舍五入，保留y位小数 |
 
-## 日期函数
+### 日期函数
 
 | 函数                                 | 功能                      |
 | ---------------------------------- | ----------------------- |
@@ -561,7 +563,7 @@ SELECT CONCAT(name, ' - ', dept_name) AS emp_info FROM emp;
 SELECT name FROM emp WHERE DATEDIFF(NOW(), entrydate) > 30;
 ```
 
-## 流程函数
+### 流程函数
 
 | 函数                                                      | 功能                                      |
 | ------------------------------------------------------- | --------------------------------------- |
@@ -583,11 +585,11 @@ FROM emp;
 
 ---
 
-# 事务
+## 事务
 
 一组不可分割的数据库操作序列，保证数据一致性，遵循ACID特性。
 
-## 事务的特性与操作
+### 事务的特性与操作
 
 | 特性 | 描述 |
 | ---- | -------------------- |
@@ -619,7 +621,7 @@ SAVEPOINT sp1;
 ROLLBACK TO sp1;
 ```
 
-## 事务隔离级别
+### 事务隔离级别
 
 | 隔离级别 | 解决并发问题 | 性能 |
 | ---- | -------------------- | ----------- |
@@ -630,11 +632,11 @@ ROLLBACK TO sp1;
 
 ---
 
-# 索引
+## 索引
 
 帮助MySQL高效获取数据的数据结构，降低查询IO成本。
 
-## 常见索引类型
+### 常见索引类型
 | 索引类型 | 适用场景                  |     |
 | ---- | --------------------- | --- |
 | 主键索引 | 主键字段自动创建，唯一非空，加速主键查询  |     |
@@ -643,7 +645,7 @@ ROLLBACK TO sp1;
 | 联合索引 | 多字段组合创建，遵循**最左前缀原则**  |     |
 | 全文索引 | 长文本内容的全文检索            |     |
 
-## 索引操作
+### 索引操作
 ```SQL
 # 查看索引
 SHOW INDEX FROM 表名;
@@ -658,7 +660,7 @@ CREATE INDEX 索引名 ON 表名(字段名, ……);
 DROP INDEX 索引名 ON 表名;
 ```
 
-# 视图
+## 视图
 
 视图是基于一个或多个表（或其他视图）创建的**虚拟表**，本身不存储实际数据，仅保存查询逻辑，数据来源于原表，原表数据变化时视图结果同步更新。
 
@@ -667,9 +669,9 @@ DROP INDEX 索引名 ON 表名;
 - 保障数据安全：隐藏原表中的敏感字段，仅向用户暴露必要的数据内容。
 - 统一数据接口：原表结构变更时，只需修改视图的查询逻辑，不影响用户的查询操作，实现数据访问与底层结构的解耦。
 
-## 视图操作
+### 视图操作
 
-### 查询视图
+#### 查询视图
 
 查询当前数据库所有视图
 ```SQL
@@ -686,7 +688,7 @@ DESC 视图名;
 SHOW CREATE VIEW 视图名;
 ```
 
-### 创建视图
+#### 创建视图
 ```SQL
 CREATE [OR REPLACE] VIEW 视图名[(自定义列名列表)]
 AS SELECT语句
@@ -715,7 +717,7 @@ WHERE salary > 5000
 WITH CASCADED CHECK OPTION;
 ```
 
-### 修改视图
+#### 修改视图
 
 使用`CREATE OR REPLACE`覆盖原视图
 ```SQL
@@ -727,12 +729,12 @@ CREATE OR REPLACE VIEW 视图名 AS 新的查询语句;
 ALTER VIEW 视图名 AS 新的查询语句;
 ```
 
-### 删除视图
+#### 删除视图
 ```SQL
 DROP VIEW [IF EXISTS] 视图名1, 视图名2, ...;
 ```
 
-## 视图的更新
+### 视图的更新
 
 视图是否可更新，取决于其定义的查询逻辑，以下场景视图**不可更新**：
 - 视图查询包含聚合函数（`COUNT`/`SUM`/`AVG`等）、`DISTINCT`、`GROUP BY`、`HAVING`、`UNION`/`UNION ALL`
@@ -754,10 +756,10 @@ VALUES ('李四', 7000, 2);
 
 ---
 
-# 触发器
+## 触发器
 触发器是与数据表关联的特殊存储逻辑，当目标表执行`INSERT`/`UPDATE`/`DELETE`等DML操作时，会自动触发执行预设的SQL语句，常用于实现数据自动校验、日志记录、数据同步等场景，保障数据的一致性与完整性。
 
-## 触发器类型
+### 触发器类型
 触发器根据触发时机和触发事件的不同，分为以下6种类型：
 
 | 触发时机 | 触发事件 | 说明 |
@@ -773,8 +775,8 @@ VALUES ('李四', 7000, 2);
 - `NEW`：代表触发事件产生的新数据，仅在`INSERT`/`UPDATE`触发时可用
 - `OLD`：代表触发事件前的旧数据，仅在`UPDATE`/`DELETE`触发时可用
 
-## 触发器操作
-### 创建触发器
+### 触发器操作
+#### 创建触发器
 ```SQL
 CREATE TRIGGER 触发器名
 触发时机 触发事件 ON 关联表名
@@ -802,7 +804,7 @@ BEGIN
 END 
 ```
 
-### 查看触发器
+#### 查看触发器
 ```SQL
 -- 查看当前数据库所有触发器
 SHOW TRIGGERS;
@@ -811,12 +813,12 @@ SHOW TRIGGERS;
 SHOW CREATE TRIGGER 触发器名;
 ```
 
-### 删除触发器
+#### 删除触发器
 ```SQL
 DROP TRIGGER [IF EXISTS] 触发器名;
 ```
 
-## 触发器注意事项
+### 触发器注意事项
 - 触发器为**行级触发**，批量操作（如批量插入1000条数据）时会触发对应次数，显著影响性能，需谨慎使用
 - 触发器中不能执行返回结果集的语句（如`SELECT * FROM 表名`），仅支持DML语句（INSERT/UPDATE/DELETE）
 - 避免在触发器中修改触发源表的数据，可能导致递归触发，引发死循环
@@ -824,10 +826,10 @@ DROP TRIGGER [IF EXISTS] 触发器名;
 
 ---
 
-# 自定义函数
+## 自定义函数
 MySQL内置函数可满足大部分基础需求，自定义函数是用户根据业务需求编写的可复用SQL逻辑，**必须返回单个值**，可在SELECT语句、WHERE条件或其他SQL中直接调用。
 
-## 创建自定义函数
+### 创建自定义函数
 ```SQL
 CREATE FUNCTION 函数名(参数1 参数类型, 参数2 参数类型, ...)
 RETURNS 返回值类型
@@ -868,7 +870,7 @@ BEGIN
 END
 ```
 
-## 调用自定义函数
+### 调用自定义函数
 ```SQL
 -- 在SELECT语句中调用，查询员工姓名、月薪、年薪
 SELECT name, salary, calc_annual_salary(salary) AS annual_salary FROM emp;
@@ -877,7 +879,7 @@ SELECT name, salary, calc_annual_salary(salary) AS annual_salary FROM emp;
 SELECT name, salary FROM emp WHERE calc_annual_salary(salary) > 100000;
 ```
 
-## 查看自定义函数
+### 查看自定义函数
 ```SQL
 -- 查看当前数据库所有自定义函数
 SHOW FUNCTION STATUS WHERE Db = '你的数据库名';
@@ -886,13 +888,13 @@ SHOW FUNCTION STATUS WHERE Db = '你的数据库名';
 SHOW CREATE FUNCTION 函数名;
 ```
 
-## 删除自定义函数
+### 删除自定义函数
 ```SQL
 DROP FUNCTION [IF EXISTS] 函数名;
 ```
 
 
-# 存储过程
+## 存储过程
 
 存储过程是一组预编译的SQL语句集合，预先存储在MySQL服务器中，可通过指定名称直接调用，用于封装复杂的业务逻辑。
 - **核心优点**：
@@ -902,9 +904,9 @@ DROP FUNCTION [IF EXISTS] 函数名;
   - 提高代码复用性，统一业务逻辑实现
   - 增强安全性，可通过权限控制限制存储过程的调用范围
 
-## 存储过程基本语法
+### 存储过程基本语法
 
-### 创建存储过程
+#### 创建存储过程
 ```SQL
 # 修改语句分隔符（避免与存储过程内的;冲突）
 DELIMITER //
@@ -934,7 +936,7 @@ DELIMITER ;
 CALL getAllEmployees();
 ```
 
-### 查看存储过程
+#### 查看存储过程
 ```SQL
 # 查看当前数据库所有存储过程
 SHOW PROCEDURE STATUS WHERE Db = '数据库名';
@@ -943,12 +945,12 @@ SHOW PROCEDURE STATUS WHERE Db = '数据库名';
 SHOW CREATE PROCEDURE 存储过程名;
 ```
 
-### 删除存储过程
+#### 删除存储过程
 ```SQL
 DROP PROCEDURE [IF EXISTS] 存储过程名;
 ```
 
-### 存储过程参数类型
+#### 存储过程参数类型
 存储过程支持三种参数方向，用于实现数据的传入与返回：
 
 | 参数类型 | 描述                     | 用途                     |
@@ -1034,16 +1036,16 @@ SELECT @level AS 工资等级;
 - 复杂业务逻辑需权衡存储过程与应用层实现：存储过程便于数据库端统一管理，但调试和维护成本较高，适合固定且复用性强的逻辑
 - 存储过程不支持动态SQL的直接拼接，如需动态SQL可使用`PREPARE`+`EXECUTE`实现
 
-# JDBC 操作数据库
+## JDBC 操作数据库
 
 [JDBC 连接 MySQL_jdbc连接mysql-CSDN博客](https://blog.csdn.net/aasd23/article/details/124218870?ops_request_misc=elastic_search_misc&request_id=f08e1dbc57313aef33c6ceea53dfa938&biz_id=0&utm_medium=distribute.pc_search_result.none-task-blog-2~all~top_positive~default-1-124218870-null-null.142^v102^pc_search_result_base6&utm_term=jdbc%E8%BF%9E%E6%8E%A5mysql&spm=1018.2226.3001.4187)
 [MySQL | JDBC连接数据库详细教程【全程干货】_mysql jdbc-CSDN博客](https://blog.csdn.net/fire_cloud_1/article/details/130791820?ops_request_misc=elastic_search_misc&request_id=f08e1dbc57313aef33c6ceea53dfa938&biz_id=0&utm_medium=distribute.pc_search_result.none-task-blog-2~all~sobaiduend~default-4-130791820-null-null.142^v102^pc_search_result_base6&utm_term=jdbc%E8%BF%9E%E6%8E%A5mysql&spm=1018.2226.3001.4187)
 
-## JDBC 概述
+### JDBC 概述
 - JDBC（Java Database Connectivity）是Java访问关系型数据库的标准API，通过统一接口实现跨数据库操作，屏蔽不同数据库的底层差异。
 - 核心价值：让Java程序与MySQL等数据库建立连接，执行SQL语句并处理返回结果，实现数据的持久化操作。
 
-## JDBC 核心组件
+### JDBC 核心组件
 | 组件                | 作用                                 |
 | ----------------- | ---------------------------------- |
 | DriverManager     | 管理JDBC驱动，负责加载驱动类并创建数据库连接实例         |
@@ -1052,7 +1054,7 @@ SELECT @level AS 工资等级;
 | PreparedStatement | 预编译SQL语句，支持参数化查询，有效防止SQL注入，性能更优    |
 | ResultSet         | 存储查询语句返回的结果集，通过游标遍历获取单行/列数据        |
 
-## JDBC 操作数据库步骤
+### JDBC 操作数据库步骤
 - 1. 导入JDBC驱动（MySQL官方提供的`mysql-connector-java`包）
 - 2. 加载并注册JDBC驱动（MySQL 8.0+版本可省略，驱动会自动注册）
 - 3. 通过`DriverManager`获取数据库连接
@@ -1061,7 +1063,7 @@ SELECT @level AS 工资等级;
 - 6. 处理查询结果集（仅查询操作需要）
 - 7. 按逆序释放资源（ResultSet → Statement → Connection）
 
-## 代码示例
+### 代码示例
 
 ```java
 import java.sql.*;

@@ -1,0 +1,47 @@
+.md-nav--secondary .md-nav__item--has-children {
+  position: relative;
+}
+
+.md-nav--secondary .toc-collapse-toggle {
+  align-items: center;
+  background: transparent;
+  border: 0;
+  color: var(--md-default-fg-color--lighter);
+  cursor: pointer;
+  display: inline-flex;
+  height: 1.5rem;
+  justify-content: center;
+  margin-left: -1.55rem;
+  padding: 0;
+  position: absolute;
+  top: 0.12rem;
+  width: 1.3rem;
+}
+
+.md-nav--secondary .toc-collapse-toggle:hover,
+.md-nav--secondary .toc-collapse-toggle:focus-visible {
+  color: var(--md-accent-fg-color);
+}
+
+.md-nav--secondary .toc-collapse-toggle::before {
+  content: "";
+  border-color: currentcolor;
+  border-style: solid;
+  border-width: 0 0.08rem 0.08rem 0;
+  height: 0.42rem;
+  transform: rotate(-45deg);
+  transition: transform 125ms ease;
+  width: 0.42rem;
+}
+
+.md-nav--secondary .md-nav__item--expanded > .toc-collapse-toggle::before {
+  transform: rotate(45deg);
+}
+
+.md-nav--secondary .md-nav__item--collapsed > .md-nav {
+  display: none;
+}
+
+.md-nav--secondary .md-nav__item--has-children > .md-nav__link {
+  padding-left: 0.15rem;
+}
