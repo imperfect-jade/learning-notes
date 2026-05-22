@@ -53,6 +53,9 @@
 | 已讲解 | 1.3 Disk Manager | 见“实验一” |
 | 已讲解 | 1.4 LRU Replacer | 见“实验一” |
 | 已讲解 | 1.5 Buffer Pool Manager | 见“实验一” |
+| 已讲解 | 2.1 Record Manager 概览 | 见“实验二” |
+| 已讲解 | 2.2 Row / Column / Schema 序列化 | 见“实验二” |
+| 已讲解 | 2.3 TablePage / TableHeap / TableIterator | 见“实验二” |
 
 ## 下一步
 
@@ -138,32 +141,9 @@ extent 1:
   data page BITMAP_SIZE
   data page BITMAP_SIZE + 1
   ...
-  
-【物理页0】固定是：DiskFileMetaPage（元数据页） 
-  extent 0（第1个区） 
-  物理页1：bitmap page（本区的位图页） 
-  物理页2：数据页（逻辑页0） 
-  物理页3：数据页（逻辑页1） 
-  物理页4：数据页（逻辑页2） 
-  ... 
-  
-  extent 1（第2个区） 
-  物理页 N：bitmap page 
-  物理页 N+1：数据页（逻辑页32） 
-  物理页 N+2：数据页（逻辑页33） 
-  ...
 ```
 
 因此逻辑页 `0` 不是物理页 `0`。物理页 `0` 被磁盘元信息占了，逻辑页 `0` 通常会映射到第一个 extent 的第一个数据页。
-
-**Extent 结构**
-Extent 是数据库磁盘空间的**区管理结构**，由**1 个 Bitmap 位图页**和**若干连续数据页**组成，是比数据页更大的连续空间分配单元。
-
-**文件头元数据页的作用**
-文件头元数据页是数据库文件的第 0 号物理页，用于存储整个数据文件的全局控制信息，包括文件标识、页大小、总页数、extent 数量、目录页与索引根页位置等。它是数据库文件的入口，系统通过它识别文件结构并初始化整个存储系统。
-
-**Bitmap 页的作用**
-Bitmap 页位于每个 extent 的起始位置，使用位图结构记录本 extent 内所有数据页的分配状态（空闲 / 已使用）。其作用是高效管理页分配与回收，快速查找空闲页，保证页不重复分配，是数据库空间管理的核心组件。
 
 映射关系可以这样推导：
 
@@ -890,3 +870,931 @@ make buffer_pool_manager_test -j
 问题：为什么 `NewPage` 失败时不能先分配磁盘页号？
 
 回答要点：如果缓冲池没有可用 frame，新页无法放入内存。此时提前分配会造成页号泄漏，测试后续期望连续页号也会失败。
+
+## 实验二：Record Manager
+
+### 1. 实验目标
+
+实验二要实现 MiniSQL 中“记录如何存储、读取、删除、遍历”的能力。实验一解决的是“页从哪里来、如何读写页”，实验二则开始真正把数据库中的一行行记录放进这些页里。
+
+这一节分为两大部分：
+
+1. 记录与模式的序列化：
+   - `Column`
+   - `Schema`
+   - `Row`
+   - `Field` 已经基本实现好，可以作为参考。
+2. 堆表管理：
+   - `TablePage`
+   - `TableHeap`
+   - `TableIterator`
+
+对应文件：
+
+- `src/include/record/field.h`
+- `src/record/types.cpp`
+- `src/include/record/column.h`
+- `src/record/column.cpp`
+- `src/include/record/schema.h`
+- `src/record/schema.cpp`
+- `src/include/record/row.h`
+- `src/record/row.cpp`
+- `src/include/page/table_page.h`
+- `src/page/table_page.cpp`
+- `src/include/storage/table_heap.h`
+- `src/storage/table_heap.cpp`
+- `src/include/storage/table_iterator.h`
+- `src/storage/table_iterator.cpp`
+- `src/include/common/rowid.h`
+
+对应测试：
+
+- `test/record/tuple_test.cpp`
+- `test/storage/table_heap_test.cpp`
+
+### 2. 相关数据库知识
+
+#### 2.1 记录、字段、模式分别是什么
+
+数据库表可以这样看：
+
+```text
+表 = 很多行 Row
+行 = 很多字段 Field
+表结构 = Schema
+列定义 = Column
+```
+
+例如：
+
+```sql
+create table account (
+  id int,
+  name char(64),
+  balance float
+);
+```
+
+在代码中：
+
+- `Column("id", kTypeInt, 0, false, false)` 表示第 0 列，名字是 `id`，类型是整数。
+- `Schema` 是一组 `Column *`。
+- `Row` 是一组 `Field *`。
+- `Field` 是某个具体值，比如 `188`、`"minisql"`、`19.99f`。
+
+所以 `Schema` 负责解释一行数据：第几个字段是什么类型、能不能是空、最大长度是多少。
+
+#### 2.2 为什么要序列化
+
+内存里的 C++ 对象不能直接写入磁盘。比如 `std::string` 内部有指针，`std::vector` 也有指针和容量信息。如果把对象的内存直接 `memcpy` 到磁盘，重启后这些指针都失效。
+
+因此数据库要把对象转换成连续字节流：
+
+```text
+内存对象 -> SerializeTo -> char buffer -> 写入页
+char buffer -> DeserializeFrom -> 内存对象
+```
+
+这就是序列化和反序列化。
+
+在 MiniSQL 中：
+
+- `Field` 序列化的是具体值。
+- `Row` 序列化的是一整行。
+- `Column` 序列化的是列定义。
+- `Schema` 序列化的是一张表或索引的结构。
+
+#### 2.3 定长字段和变长字段
+
+本项目支持三种类型：
+
+- `integer`
+- `float`
+- `char(n)`
+
+`int` 和 `float` 是定长字段：
+
+```text
+int   -> 4 bytes
+float -> 4 bytes
+```
+
+`char(n)` 在这里按变长字符串存储。`Field` 的实现中，`TypeChar::SerializeTo` 会先写字符串实际长度，再写字符串内容：
+
+```text
+char field = [length: uint32_t][content bytes]
+```
+
+注意：字符串内容可能包含 `'\0'`，不能依赖 C 字符串结束符。测试里已经出现了这种情况。
+
+#### 2.4 Null 值和 Null Bitmap
+
+数据库里字段可以是 `NULL`。如果某个字段是 `NULL`，它不需要保存具体值，只需要记录“这个字段为空”。
+
+`Field` 已经支持空值：
+
+```cpp
+Field(TypeId::kTypeInt)
+Field(TypeId::kTypeFloat)
+Field(TypeId::kTypeChar)
+```
+
+这些构造出来的字段 `IsNull()` 为 true。
+
+`Row` 序列化时，推荐使用 null bitmap：
+
+```text
+[field_count][null bitmap][field payloads...]
+```
+
+其中 null bitmap 的每一位表示一个字段是否为 NULL：
+
+```text
+bit = 1 -> NULL
+bit = 0 -> not NULL
+```
+
+如果一行有 3 个字段，那么 null bitmap 至少需要 1 字节。如果一行有 10 个字段，那么需要 2 字节。
+
+计算方法：
+
+```text
+bitmap_size = (field_count + 7) / 8
+```
+
+#### 2.5 RowId 是什么
+
+每条记录都有一个唯一位置标识 `RowId`。
+
+代码位置：
+
+- `src/include/common/rowid.h`
+
+`RowId` 内部由两部分组成：
+
+```text
+| page_id: 32 bits | slot_num: 32 bits |
+```
+
+含义：
+
+- `page_id`：记录在哪个 `TablePage` 中。
+- `slot_num`：记录是这个页里的第几个槽位。
+
+所以如果你有一个 `RowId`，就可以直接定位记录：
+
+1. 通过 `page_id` 找到表页。
+2. 通过 `slot_num` 找到页内槽位。
+3. 根据槽位中的 offset 和 size 找到实际数据。
+
+这也是后面索引为什么只需要保存 `key -> RowId` 的原因：索引找到 key 对应的 RowId，堆表就能拿到完整记录。
+
+#### 2.6 什么是堆表
+
+堆表 `TableHeap` 是一种最简单的表组织方式：
+
+- 记录无序存放。
+- 插入时找一个能放下记录的页。
+- 页不够就新建页。
+- 多个 `TablePage` 通过链表连接。
+
+它不保证记录按照主键、插入时间或任何字段排序。它只是“把记录塞进去，并能通过 RowId 找回来”。
+
+#### 2.7 什么是 Slotted Page
+
+`TablePage` 使用的是槽页结构，也叫 slotted page。
+
+一个页内大致长这样：
+
+```text
+| page header | slot 0 | slot 1 | slot 2 | free space | tuple data |
+```
+
+头部和槽数组从前往后增长，真实记录数据从后往前增长：
+
+```text
+低地址                                                     高地址
+| header | slots ---->       free space       <---- tuples |
+```
+
+每个 slot 保存两件事：
+
+```text
+tuple_offset
+tuple_size
+```
+
+好处是：
+
+1. 记录可以变长。
+2. 页内记录移动后，只需要更新 slot 中的 offset。
+3. `RowId` 中的 `slot_num` 可以稳定定位记录。
+
+### 3. 小实验 2.2：Column / Schema / Row 序列化
+
+#### 3.1 Field 已经给你什么
+
+`Field` 的序列化已经由 `Type` 子类实现。
+
+关键接口：
+
+```cpp
+field.SerializeTo(buf);
+Field::DeserializeFrom(buf, type_id, &field, is_null);
+field.GetSerializedSize();
+```
+
+不同类型行为：
+
+- `int`：写 4 字节。
+- `float`：写 4 字节。
+- `char`：写 4 字节长度，再写内容。
+- `NULL`：不写具体值，序列化长度为 0。
+
+所以实现 `Row` 时，你不需要自己判断 int/float/char 的具体编码，只要调用 `Field` 的接口。
+
+#### 3.2 Column 推荐序列化格式
+
+`Column` 保存的是列定义：
+
+```cpp
+std::string name_;
+TypeId type_;
+uint32_t len_;
+uint32_t table_ind_;
+bool nullable_;
+bool unique_;
+```
+
+推荐格式：
+
+```text
+[magic: uint32_t]
+[name_len: uint32_t]
+[name bytes]
+[type: uint32_t]
+[len: uint32_t]
+[table_ind: uint32_t]
+[nullable: uint32_t]
+[unique: uint32_t]
+```
+
+这里建议把 `bool` 也用 `uint32_t` 存，原因是磁盘格式最好固定，不要依赖 C++ 中 `bool` 的大小和对象布局。
+
+`GetSerializedSize()`：
+
+```text
+4 + 4 + name.length() + 4 + 4 + 4 + 4 + 4
+= 28 + name.length()
+```
+
+`SerializeTo(buf)`：
+
+1. 写 `COLUMN_MAGIC_NUM`。
+2. 写名字长度。
+3. 写名字内容。
+4. 写类型。
+5. 写长度。
+6. 写列下标。
+7. 写 nullable。
+8. 写 unique。
+9. 返回写入字节数。
+
+`DeserializeFrom(buf, column)`：
+
+1. 读 magic 并检查。
+2. 读名字长度和名字。
+3. 读 type、len、index、nullable、unique。
+4. 根据 type 创建 Column：
+   - 如果是 `kTypeChar`，使用带 length 的构造函数。
+   - 如果是 `kTypeInt` 或 `kTypeFloat`，使用非 char 构造函数。
+5. 返回读过的字节数。
+
+#### 3.3 Schema 推荐序列化格式
+
+`Schema` 是一组 `Column *`。
+
+推荐格式：
+
+```text
+[magic: uint32_t]
+[column_count: uint32_t]
+[column 0]
+[column 1]
+...
+```
+
+`GetSerializedSize()`：
+
+```text
+8 + sum(column.GetSerializedSize())
+```
+
+`SerializeTo(buf)`：
+
+1. 写 `SCHEMA_MAGIC_NUM`。
+2. 写列数量。
+3. 依次调用每个 `Column::SerializeTo`。
+4. 返回总字节数。
+
+`DeserializeFrom(buf, schema)`：
+
+1. 读 magic 并检查。
+2. 读列数量。
+3. 循环调用 `Column::DeserializeFrom`。
+4. 把得到的 `Column *` 放入 vector。
+5. 创建 `new Schema(columns, true)`。
+6. 返回总字节数。
+
+内存管理重点：这里反序列化出来的列对象是新建的，所以 `Schema` 应该管理它们，也就是 `is_manage_ = true`。
+
+#### 3.4 Row 推荐序列化格式
+
+`Row` 是一组字段值，必须结合 `Schema` 才能解释。
+
+推荐格式：
+
+```text
+[field_count: uint32_t]
+[null bitmap]
+[non-null field payloads...]
+```
+
+例子：
+
+```text
+schema: id int, name char, account float
+row:    188, "minisql", 19.99
+
+serialized:
+[3]
+[00000000]
+[int payload][char payload][float payload]
+```
+
+如果第二列为 NULL：
+
+```text
+row: 188, NULL, 19.99
+
+null bitmap:
+bit 1 = 1
+
+payload:
+[int payload][float payload]
+```
+
+NULL 字段不占 payload 空间。
+
+`GetSerializedSize(schema)`：
+
+1. header 大小：`sizeof(uint32_t)`。
+2. null bitmap 大小：`(field_count + 7) / 8`。
+3. 对每个非空字段，加上 `field->GetSerializedSize()`。
+
+`SerializeTo(buf, schema)`：
+
+1. 检查 `schema->GetColumnCount() == fields_.size()`。
+2. 写字段数量。
+3. 清空 null bitmap 区域。
+4. 遍历字段：
+   - 如果字段是 NULL，设置 bitmap 对应 bit。
+   - 如果不是 NULL，在 payload 区域调用 `field->SerializeTo`。
+5. 返回写入字节数。
+
+`DeserializeFrom(buf, schema)`：
+
+1. 读字段数量，并检查等于 schema 列数。
+2. 定位 null bitmap。
+3. 对每一列：
+   - 从 schema 中取类型。
+   - 判断这一列是否 NULL。
+   - 调用 `Field::DeserializeFrom(payload_ptr, type, &field, is_null)`。
+   - 把返回的字节数加到 payload offset。
+   - 把 `field` 放入 `fields_`。
+4. 返回读过的总字节数。
+
+注意：`Row::DeserializeFrom` 里创建的 `Field *` 会被 `Row` 析构函数释放，不要手动提前 delete。
+
+#### 3.5 测试怎么理解
+
+`tuple_test.cpp` 有两个测试。
+
+`FieldSerializeDeserializeTest`：
+
+- 这个测试验证 `Field` 自己已经能正常序列化。
+- 你通常不用改 `Field`。
+- 它也提醒你：char 不能按 C 字符串处理，因为测试里有 `"\0"`。
+
+`RowTest`：
+
+流程：
+
+1. 创建 schema：`id int, name char(64), account float`。
+2. 创建 row：`188, "minisql", 19.99f`。
+3. 把 row 插入一个 `TablePage`。
+4. 通过 rid 读出 row2。
+5. 比较 row2 的每个字段和原字段是否相等。
+6. 测试逻辑删除和物理删除。
+
+因此这个测试主要依赖：
+
+- `Row::SerializeTo`
+- `Row::DeserializeFrom`
+- `Row::GetSerializedSize`
+
+如果 Row 序列化不对，`TablePage::GetTuple` 读出的字段就会错。
+
+### 4. 小实验 2.3：TablePage
+
+#### 4.1 当前代码状态
+
+`TablePage` 的大部分实现已经在 `src/page/table_page.cpp` 中给出，包括：
+
+- `Init`
+- `InsertTuple`
+- `MarkDelete`
+- `UpdateTuple`
+- `ApplyDelete`
+- `RollbackDelete`
+- `GetTuple`
+- `GetFirstTupleRid`
+- `GetNextTupleRid`
+
+这意味着你需要重点读懂它，而不是重写它。
+
+#### 4.2 TablePage 页内布局
+
+头部字段：
+
+```text
+PageId
+LSN
+PrevPageId
+NextPageId
+FreeSpacePointer
+TupleCount
+Slot array...
+```
+
+每个 slot 由 8 字节组成：
+
+```text
+TupleOffset: 4 bytes
+TupleSize:   4 bytes
+```
+
+`FreeSpacePointer` 初始为 `PAGE_SIZE`，插入记录后向低地址移动。
+
+#### 4.3 InsertTuple 做了什么
+
+插入一条记录时：
+
+1. 调用 `row.GetSerializedSize(schema)` 得到记录字节数。
+2. 检查剩余空间是否足够容纳：
+   - 记录本体。
+   - 一个 slot。
+3. 优先复用空 slot，即 `TupleSize == 0` 的槽。
+4. 移动 `FreeSpacePointer`。
+5. 调用 `row.SerializeTo` 把记录写到页尾区域。
+6. 设置 slot 的 offset 和 size。
+7. 给 row 设置 `RowId(page_id, slot_num)`。
+8. 如果用了新 slot，`TupleCount++`。
+
+#### 4.4 MarkDelete 和 ApplyDelete 的区别
+
+删除分两步：
+
+1. `MarkDelete`：逻辑删除，只是在 tuple size 的最高位打 delete mask。
+2. `ApplyDelete`：物理删除，真正移动页内数据，释放空间，把 slot 清空。
+
+为什么要分两步？因为真实数据库里删除可能和事务有关。事务还没提交时，不能马上把数据物理抹掉；否则回滚时很难恢复。
+
+本实验事务暂时不完整，但保留了这个设计。
+
+#### 4.5 GetFirstTupleRid 和 GetNextTupleRid
+
+这两个函数是迭代器的基础：
+
+- `GetFirstTupleRid`：找当前页第一条未删除记录。
+- `GetNextTupleRid`：从当前 slot 后面继续找下一条未删除记录。
+
+如果当前页没有下一条，`TableIterator` 要跳到链表中的下一个 `TablePage`。
+
+### 5. 小实验 2.3：TableHeap
+
+#### 5.1 TableHeap 是什么
+
+`TableHeap` 管理一整张表的数据页链表。
+
+它只保存第一个页：
+
+```cpp
+page_id_t first_page_id_;
+```
+
+每个 `TablePage` 内部保存：
+
+```cpp
+PrevPageId
+NextPageId
+```
+
+所以整张表是一个双向链表。
+
+#### 5.2 构造函数实现指导
+
+当前 `TableHeap` 创建新表的构造函数里有：
+
+```cpp
+ASSERT(false, "Not implemented yet.");
+```
+
+你需要做的是：
+
+1. 调用 `buffer_pool_manager_->NewPage(first_page_id_)` 创建第一页。
+2. 把返回的 `Page *` 转成 `TablePage *`。
+3. 调用：
+
+```cpp
+table_page->Init(first_page_id_, INVALID_PAGE_ID, log_manager_, txn);
+```
+
+4. 调用 `UnpinPage(first_page_id_, true)`。
+
+这里 `true` 表示第一页头部已经被初始化，是脏页，需要未来写回。
+
+#### 5.3 InsertTuple 实现指导
+
+目标：把一行插入表中，并通过 `row.SetRowId` 返回它的位置。
+
+步骤：
+
+1. 如果行太大，直接返回 `false`。
+
+```cpp
+row.GetSerializedSize(schema_) > TablePage::SIZE_MAX_ROW
+```
+
+2. 从 `first_page_id_` 开始遍历表页。
+3. 对每个页：
+   - `FetchPage`
+   - 转成 `TablePage *`
+   - 加写锁 `WLatch`
+   - 调用 `page->InsertTuple(row, schema_, txn, lock_manager_, log_manager_)`
+4. 如果插入成功：
+   - 解锁。
+   - `UnpinPage(page_id, true)`。
+   - 返回 `true`。
+5. 如果当前页放不下：
+   - 如果有 `NextPageId`，解锁并 unpin 当前页，继续下一页。
+   - 如果没有下一页，创建新页。
+6. 创建新页时：
+   - `NewPage(new_page_id)`
+   - `new_page->Init(new_page_id, old_page_id, ...)`
+   - 当前页 `SetNextPageId(new_page_id)`
+   - 当前页 dirty unpin。
+   - 在新页插入 row。
+   - 新页 dirty unpin。
+
+注意：每次 `FetchPage` 后都必须 `UnpinPage`，否则实验一里的 pin count 会卡住，后续缓冲池可能无法替换页面。
+
+#### 5.4 GetTuple 实现指导
+
+目标：根据 row 中已有的 RowId 读出完整字段。
+
+步骤：
+
+1. 从 `row->GetRowId().GetPageId()` 得到页号。
+2. `FetchPage(page_id)`。
+3. 转成 `TablePage *`。
+4. 可以加读锁 `RLatch`。
+5. 调用：
+
+```cpp
+page->GetTuple(row, schema_, txn, lock_manager_)
+```
+
+6. 解锁。
+7. `UnpinPage(page_id, false)`。
+8. 返回结果。
+
+测试 `table_heap_test.cpp` 会大量调用它验证插入的 10000 条记录是否都能读回。
+
+#### 5.5 MarkDelete 实现提示
+
+当前 `MarkDelete` 已经写了一部分，但有一个细节值得你检查：它调用了 `page->MarkDelete(...)`，但没有保存这个函数的返回值。
+
+更稳妥的行为应该是：
+
+1. 如果页不存在，返回 `false`。
+2. 如果 slot 无效或记录已删除，返回 `false`。
+3. 只有真正标记成功才返回 `true`。
+
+这对后面的 `DeleteExecutor` 更友好。
+
+#### 5.6 ApplyDelete 实现指导
+
+目标：物理删除某个 RowId 对应的记录。
+
+步骤：
+
+1. `FetchPage(rid.GetPageId())`。
+2. 转成 `TablePage *`。
+3. 加写锁。
+4. 调用 `page->ApplyDelete(rid, txn, log_manager_)`。
+5. 解锁。
+6. `UnpinPage(page_id, true)`。
+
+#### 5.7 UpdateTuple 实现指导
+
+目标：更新某个 RowId 对应的记录。
+
+最基础版本：
+
+1. 根据 rid 找到页面。
+2. 构造 `Row old_row(rid)`。
+3. 调用 `page->UpdateTuple(new_row, &old_row, schema_, txn, lock_manager_, log_manager_)`。
+4. 如果成功，把 `new_row` 的 RowId 设置为原 rid。
+5. unpin dirty page。
+
+更完整版本需要处理“更新后记录变大，当前页放不下”的情况：
+
+1. 先确认旧记录存在。
+2. 如果 `TablePage::UpdateTuple` 失败是因为空间不足，可以：
+   - 逻辑删除旧记录。
+   - 物理删除旧记录。
+   - 把新记录作为一条新 tuple 插入表中。
+3. 此时新记录的 RowId 可能变化。
+
+实验文档也提醒：当前 `TablePage::UpdateTuple` 只返回 bool，无法区分失败原因。因此实现时最好先 `GetTuple` 确认记录存在，再决定是否 fallback。
+
+#### 5.8 Begin 和 End 实现指导
+
+`Begin(txn)`：
+
+1. 从 `first_page_id_` 开始。
+2. 对每一页调用 `GetFirstTupleRid`。
+3. 找到第一条未删除记录后，返回：
+
+```cpp
+TableIterator(this, first_rid, txn)
+```
+
+4. 如果所有页都没有记录，返回 `End()`。
+
+`End()`：
+
+可以用无效 RowId 表示：
+
+```cpp
+TableIterator(this, INVALID_ROWID, nullptr)
+```
+
+或者自己在 iterator 中维护 `is_end_` 标志。关键是比较操作要稳定。
+
+### 6. 小实验 2.3：TableIterator
+
+#### 6.1 迭代器为什么重要
+
+后面的执行器 `SeqScanExecutor` 会依赖表迭代器来做全表扫描。
+
+SQL：
+
+```sql
+select * from account;
+```
+
+底层就是：
+
+```cpp
+for (auto iter = table_heap->Begin(txn); iter != table_heap->End(); ++iter) {
+  Row row = *iter;
+}
+```
+
+所以 `TableIterator` 是 Record Manager 和 Executor 之间的重要桥梁。
+
+#### 6.2 推荐成员变量
+
+当前 `table_iterator.h` 允许你添加私有成员。
+
+推荐：
+
+```cpp
+TableHeap *table_heap_;
+Txn *txn_;
+Row row_;
+```
+
+其中：
+
+- `table_heap_`：知道自己属于哪张表。
+- `txn_`：传给 GetTuple。
+- `row_`：当前迭代器指向的记录。
+
+如果 `row_.GetRowId() == INVALID_ROWID`，就表示 end。
+
+#### 6.3 构造函数实现指导
+
+```cpp
+TableIterator(TableHeap *table_heap, RowId rid, Txn *txn)
+```
+
+步骤：
+
+1. 保存 `table_heap_` 和 `txn_`。
+2. 如果 `rid` 是无效 RowId，设置为空迭代器。
+3. 否则构造 `Row row(rid)`。
+4. 调用 `table_heap_->GetTuple(&row, txn_)` 把完整字段读出来。
+5. 保存到 `row_`。
+
+#### 6.4 operator* 和 operator->
+
+`operator*()`：
+
+```cpp
+return row_;
+```
+
+`operator->()`：
+
+```cpp
+return &row_;
+```
+
+如果当前是 end，最好 assert，避免误用。
+
+#### 6.5 operator== 和 operator!=
+
+推荐比较：
+
+```text
+table_heap_ 是否相同
+当前 RowId 是否相同
+```
+
+`operator!=` 可以直接取反。
+
+#### 6.6 operator++ 实现指导
+
+`++iter` 要移动到下一条有效记录。
+
+步骤：
+
+1. 如果当前已经是 end，直接返回自己。
+2. 取当前 `RowId cur_rid`。
+3. Fetch 当前页。
+4. 调用 `GetNextTupleRid(cur_rid, &next_rid)`。
+5. 如果当前页还有下一条：
+   - unpin 当前页。
+   - 用 `next_rid` 重新加载 `row_`。
+   - 返回。
+6. 如果当前页没有下一条：
+   - 取当前页的 `NextPageId`。
+   - unpin 当前页。
+   - 沿链表向后找。
+   - 对每个后续页调用 `GetFirstTupleRid`。
+7. 如果找到，加载该 row。
+8. 如果一直找不到，设置为 end。
+
+`iter++` 是后置自增，语义是“返回移动前的副本，然后自己前进”：
+
+```cpp
+TableIterator old(*this);
+++(*this);
+return old;
+```
+
+### 7. 测试怎么理解
+
+#### 7.1 tuple_test.cpp
+
+这个测试的核心是：
+
+1. `Field` 本身能序列化和反序列化。
+2. `Row` 能通过 `TablePage` 写入，再通过 RowId 读出。
+3. 读出的字段和原字段逐一相等。
+4. 删除接口能工作。
+
+如果这个测试失败：
+
+- 优先检查 `Row::SerializeTo`。
+- 然后检查 `Row::DeserializeFrom`。
+- 再检查 `Row::GetSerializedSize` 是否和真正写入字节数一致。
+
+`TablePage::InsertTuple` 中有断言：
+
+```cpp
+ASSERT(write_bytes == serialized_size, "Unexpected behavior in row serialize.");
+```
+
+所以 `GetSerializedSize` 和 `SerializeTo` 必须严格一致。
+
+#### 7.2 table_heap_test.cpp
+
+这个测试会：
+
+1. 创建一个 `TableHeap`。
+2. 随机生成 10000 条记录。
+3. 每条记录插入后保存 `RowId -> Fields`。
+4. 再根据每个 RowId 调用 `GetTuple`。
+5. 比较读出的字段和原字段是否一致。
+
+它主要验证：
+
+- `TableHeap` 构造函数能创建第一页。
+- `InsertTuple` 能跨页插入大量记录。
+- 每条记录的 RowId 唯一。
+- `GetTuple` 能通过 RowId 正确读回记录。
+
+注意：这个测试没有直接测 iterator、update、delete 的所有边界，但后面的 executor 会依赖它们。
+
+### 8. 推荐完成顺序
+
+建议不要先碰 `TableHeap`。先把序列化写稳。
+
+推荐顺序：
+
+1. 完成 `Column::SerializeTo / DeserializeFrom / GetSerializedSize`。
+2. 完成 `Schema::SerializeTo / DeserializeFrom / GetSerializedSize`。
+3. 完成 `Row::SerializeTo / DeserializeFrom / GetSerializedSize`。
+4. 运行 `tuple_test`。
+5. 实现 `TableHeap` 创建第一页。
+6. 实现 `TableHeap::InsertTuple`。
+7. 实现 `TableHeap::GetTuple`。
+8. 运行 `table_heap_test`。
+9. 补全 `ApplyDelete / UpdateTuple / Begin / End / TableIterator`。
+10. 回头为后续 executor 准备更多自测。
+
+构建命令：
+
+```bash
+mkdir build
+cd build
+cmake ..
+make tuple_test -j
+./test/tuple_test
+make table_heap_test -j
+./test/table_heap_test
+```
+
+如果已经构建过，通常只需要：
+
+```bash
+make tuple_test -j
+./test/tuple_test
+make table_heap_test -j
+./test/table_heap_test
+```
+
+### 9. 常见错误清单
+
+1. `Column` 序列化时写了 `std::string` 对象本身，而不是字符串长度和内容。
+2. `Schema::DeserializeFrom` 创建的 Column 没有交给 Schema 管理，导致内存泄漏。
+3. `Row::GetSerializedSize` 和 `Row::SerializeTo` 返回值不一致。
+4. NULL 字段仍然写入 payload，导致反序列化 offset 错位。
+5. `char` 字段按 C 字符串处理，遇到 `'\0'` 截断。
+6. `TableHeap` 构造函数创建第一页后忘记 `UnpinPage(first_page_id_, true)`。
+7. `InsertTuple` 遍历页时，Fetch 后忘记 Unpin。
+8. 当前页满了，新建页后忘记设置当前页的 `NextPageId`。
+9. 新页 Init 时 `prev_id` 没设置为当前页号。
+10. `GetTuple` 根据 RowId 取页后忘记 unpin。
+11. `TableIterator::operator++` 只在当前页找下一条，忘记跳到下一页。
+12. `iter++` 返回了移动后的迭代器，而不是移动前的副本。
+13. 删除时只做 MarkDelete，忘记 ApplyDelete 才会真正释放页内空间。
+14. 更新失败时不区分“记录不存在”和“空间不足”。
+
+### 10. 验收问答准备
+
+问题：为什么 Row 的序列化需要 Schema？
+
+回答要点：Row 只保存字段值，字段类型和列数量来自 Schema。反序列化时必须知道第 i 个字段是什么类型，才能正确调用 `Field::DeserializeFrom`。
+
+问题：为什么不能直接把 Column 或 Schema 对象 memcpy 到磁盘？
+
+回答要点：它们包含 `std::string`、`std::vector`、指针等内存结构，直接写入磁盘后重启无法恢复。必须转成稳定的字节格式。
+
+问题：为什么 Row 要有 null bitmap？
+
+回答要点：NULL 字段没有实际 payload。如果不额外记录哪些字段为 NULL，反序列化时无法判断这个字段是空值还是一个长度为 0 的普通值。
+
+问题：RowId 的作用是什么？
+
+回答要点：RowId 把记录位置编码为 `page_id + slot_num`，可以直接定位到表页和页内槽位。后续索引只需要保存 `key -> RowId`，就能回表读取完整记录。
+
+问题：TableHeap 和 TablePage 的关系是什么？
+
+回答要点：TablePage 管理单个页内的记录布局；TableHeap 管理一张表的多个 TablePage，它通过页链表完成跨页插入、查找和遍历。
+
+问题：为什么 Slotted Page 适合存变长记录？
+
+回答要点：slot 保存 offset 和 size，真实记录可以放在页尾。记录移动或压缩时，只需要更新 slot，不需要改变 RowId 中的 slot_num。
+
+问题：逻辑删除和物理删除有什么区别？
+
+回答要点：逻辑删除只是打标记，方便事务回滚；物理删除才真正移动页内数据并释放空间。真实数据库通常不会在事务未提交前直接物理删除。
+
+问题：TableIterator 为什么要跨页？
+
+回答要点：一张表通常由多个 TablePage 组成。全表扫描不能只扫第一页，必须在当前页没有下一条记录时跳到 `NextPageId` 指向的下一页。
