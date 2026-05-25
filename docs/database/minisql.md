@@ -56,6 +56,10 @@
 | 已讲解 | 2.1 Record Manager 概览 | 见“实验二” |
 | 已讲解 | 2.2 Row / Column / Schema 序列化 | 见“实验二” |
 | 已讲解 | 2.3 TablePage / TableHeap / TableIterator | 见“实验二” |
+| 已讲解 | 3.1 Index Manager 概览 | 见“实验三” |
+| 已讲解 | 3.2 B+ 树页结构 | 见“实验三” |
+| 已讲解 | 3.3 B+ 树插入、查找、删除 | 见“实验三” |
+| 已讲解 | 3.4 IndexIterator 与 BPlusTreeIndex | 见“实验三” |
 
 ## 下一步
 
@@ -1798,3 +1802,1100 @@ make table_heap_test -j
 问题：TableIterator 为什么要跨页？
 
 回答要点：一张表通常由多个 TablePage 组成。全表扫描不能只扫第一页，必须在当前页没有下一条记录时跳到 `NextPageId` 指向的下一页。
+
+## 实验三：Index Manager
+
+### 1. 实验目标
+
+实验三要实现 MiniSQL 的索引管理，核心是一个基于磁盘页的 B+ 树。前两次实验之后，数据库已经能分配页、缓存页、把记录插入堆表，也能通过 `RowId` 读回记录。但如果没有索引，查询一条记录只能全表扫描。
+
+例如：
+
+```sql
+select * from account where id = 10086;
+```
+
+没有索引时，需要从 `TableHeap::Begin()` 一直扫到 `End()`，逐行比较 `id`。如果表里有十万条记录，就可能比较十万次。
+
+有 B+ 树索引后，查询变成：
+
+```text
+key(id=10086) -> B+ 树查找 -> RowId -> TableHeap::GetTuple
+```
+
+这一节要完成四层内容：
+
+1. B+ 树通用页头：`BPlusTreePage`
+2. B+ 树叶子页与内部页：`BPlusTreeLeafPage`、`BPlusTreeInternalPage`
+3. 整棵 B+ 树：`BPlusTree`
+4. 索引封装与迭代器：`BPlusTreeIndex`、`IndexIterator`
+
+对应文件：
+
+- `src/include/page/b_plus_tree_page.h`
+- `src/page/b_plus_tree_page.cpp`
+- `src/include/page/b_plus_tree_leaf_page.h`
+- `src/page/b_plus_tree_leaf_page.cpp`
+- `src/include/page/b_plus_tree_internal_page.h`
+- `src/page/b_plus_tree_internal_page.cpp`
+- `src/include/index/b_plus_tree.h`
+- `src/index/b_plus_tree.cpp`
+- `src/include/index/index_iterator.h`
+- `src/index/index_iterator.cpp`
+- `src/include/index/b_plus_tree_index.h`
+- `src/index/b_plus_tree_index.cpp`
+- `src/include/index/generic_key.h`
+- `src/include/page/index_roots_page.h`
+- `src/page/index_roots_page.cpp`
+
+对应测试：
+
+- `test/index/b_plus_tree_test.cpp`
+- `test/index/b_plus_tree_index_test.cpp`
+- `test/index/index_iterator_test.cpp`
+
+### 2. 相关数据库知识
+
+#### 2.1 为什么需要索引
+
+堆表的优点是插入简单，但缺点是查找慢。对于条件查询：
+
+```sql
+where id = 123
+```
+
+没有索引时只能顺序扫描。复杂度是：
+
+```text
+O(N)
+```
+
+B+ 树索引把查找复杂度降为：
+
+```text
+O(log_f N)
+```
+
+这里 `f` 是一个内部节点能容纳的孩子数，也叫 fanout。数据库页通常是 4KB，一个内部节点可以存很多 key 和 child pointer，所以树高通常很低。
+
+真实数据库中，即使有几百万条记录，B+ 树高度也常常只有 3 到 4 层。
+
+#### 2.2 B 树和 B+ 树有什么区别
+
+B 树可以在内部节点和叶子节点都存数据。
+
+B+ 树的特点是：
+
+1. 真正的数据指针只存在叶子节点。
+2. 内部节点只负责导航。
+3. 所有叶子节点按 key 顺序串成链表。
+
+这非常适合数据库：
+
+- 点查：从根走到叶子。
+- 范围查：先找到起点叶子，再沿叶子链表往后扫。
+- 顺序遍历：直接从最左叶子开始扫。
+
+本项目中的叶子节点存：
+
+```text
+key -> RowId
+```
+
+内部节点存：
+
+```text
+key -> child page_id
+```
+
+拿到 `RowId` 后，再回到 `TableHeap` 读取完整记录。
+
+#### 2.3 为什么索引里存 RowId 而不是整行
+
+索引通常不保存整条记录，只保存索引键和记录位置。
+
+例如对 `id` 建索引：
+
+```text
+id = 10086 -> RowId(page_id, slot_num)
+```
+
+好处：
+
+1. 索引更小，一个页能放更多 key。
+2. 树高度更低。
+3. 表记录更新时，只要 RowId 不变，索引不需要保存整行副本。
+
+代价是：通过索引找到 RowId 后，还需要回表读取完整 Row。
+
+#### 2.4 本项目中的 GenericKey
+
+索引键可能是单列，也可能是多列。
+
+例如：
+
+```sql
+create index idx on account(id, name);
+```
+
+这个 key 由两列组成：`id` 和 `name`。
+
+为了统一处理不同类型的 key，框架提供了：
+
+- `GenericKey`
+- `KeyManager`
+
+`GenericKey` 本质是一段字节数组。`KeyManager::SerializeFromKey` 会把一个 `Row` 序列化进 `GenericKey`。`KeyManager::CompareKeys` 会把两个 `GenericKey` 反序列化成 Row，然后逐字段比较。
+
+所以写 B+ 树时，不要自己解释 key 的类型，只要调用：
+
+```cpp
+processor_.CompareKeys(lhs, rhs)
+```
+
+比较结果：
+
+```text
+< 0: lhs < rhs
+= 0: lhs == rhs
+> 0: lhs > rhs
+```
+
+#### 2.5 本项目只支持 Unique Key
+
+文档和代码都说明：
+
+```text
+Only support unique key.
+```
+
+也就是说同一个索引 key 只能出现一次。
+
+因此：
+
+- 插入重复 key 应返回 `false`。
+- `GetValue` 最多返回一个 RowId。
+- 叶子页的 `Lookup` 找到后即可结束。
+
+### 3. B+ 树页结构
+
+#### 3.1 BPlusTreePage：公共页头
+
+`BPlusTreePage` 是内部页和叶子页的公共头部。
+
+字段：
+
+```cpp
+IndexPageType page_type_;
+int key_size_;
+lsn_t lsn_;
+int size_;
+int max_size_;
+page_id_t parent_page_id_;
+page_id_t page_id_;
+```
+
+含义：
+
+- `page_type_`：叶子页还是内部页。
+- `key_size_`：每个 key 的字节数。
+- `size_`：当前页内有多少 pair。
+- `max_size_`：最多能放多少 pair。
+- `parent_page_id_`：父节点页号。
+- `page_id_`：当前节点页号。
+
+要实现的函数：
+
+```cpp
+IsLeafPage()
+IsRootPage()
+SetPageType()
+GetMaxSize()
+SetMaxSize()
+GetMinSize()
+GetParentPageId()
+```
+
+实现要点：
+
+- `IsLeafPage()` 判断 `page_type_ == IndexPageType::LEAF_PAGE`。
+- `IsRootPage()` 判断 `parent_page_id_ == INVALID_PAGE_ID`。
+- `GetMinSize()` 通常返回 `max_size_ / 2`。
+- 根节点是特殊情况，根节点允许比普通节点更少。
+
+根节点最小大小可以这样理解：
+
+```text
+叶子根：至少 1 个 key，空树除外
+内部根：至少 2 个 child pointer
+普通节点：至少半满
+```
+
+在简单实现中，`GetMinSize()` 可以先处理普通节点半满逻辑，根节点收缩由 `AdjustRoot` 单独处理。
+
+#### 3.2 LeafPage：叶子页
+
+叶子页保存真正的索引项：
+
+```text
+key -> RowId
+```
+
+页内格式：
+
+```text
+| BPlusTreePage header | next_page_id | pair array |
+```
+
+代码里用宏计算 pair 位置：
+
+```cpp
+#define pair_size (GetKeySize() + sizeof(RowId))
+#define key_off 0
+#define val_off GetKeySize()
+```
+
+也就是说，第 `i` 个 pair 的位置是：
+
+```text
+data_ + i * pair_size
+```
+
+要实现的关键函数：
+
+```cpp
+Init()
+KeyIndex()
+Insert()
+Lookup()
+RemoveAndDeleteRecord()
+MoveHalfTo()
+MoveAllTo()
+MoveFirstToEndOf()
+MoveLastToFrontOf()
+```
+
+#### 3.3 LeafPage::Init
+
+初始化时需要设置：
+
+```text
+page_type = LEAF_PAGE
+size = 0
+page_id = page_id
+parent_page_id = parent_id
+key_size = key_size
+max_size = max_size 或根据页面大小计算
+next_page_id = INVALID_PAGE_ID
+lsn = INVALID_LSN
+```
+
+默认 `max_size` 可以按容量计算：
+
+```text
+max_size = (PAGE_SIZE - LEAF_PAGE_HEADER_SIZE) / (key_size + sizeof(RowId))
+```
+
+有些实现会保守地减 1，给 split 留余量；关键是插入、split 和测试保持一致。
+
+#### 3.4 LeafPage::KeyIndex
+
+目标：找到第一个 `key_at(i) >= input_key` 的位置。
+
+这是典型 lower_bound。
+
+伪逻辑：
+
+```text
+left = 0
+right = size
+while left < right:
+  mid = (left + right) / 2
+  if KeyAt(mid) < key:
+    left = mid + 1
+  else:
+    right = mid
+return left
+```
+
+这个函数用于：
+
+- 插入时找到插入位置。
+- 查找时找到可能位置。
+- `Begin(key)` 找范围扫描起点。
+
+#### 3.5 LeafPage::Insert
+
+目标：把 `(key, RowId)` 按 key 顺序插入。
+
+步骤：
+
+1. 调用 `KeyIndex(key)` 找位置。
+2. 如果位置未越界且 key 相等，说明重复 key，通常不插入。
+3. 把当前位置之后的 pair 整体右移一个位置。
+4. 写入 key 和 RowId。
+5. `IncreaseSize(1)`。
+6. 返回新 size。
+
+因为 B+ 树只支持 unique key，重复 key 必须拒绝。
+
+#### 3.6 LeafPage::Lookup
+
+步骤：
+
+1. 调用 `KeyIndex(key)`。
+2. 如果 index < size 且 key 相等：
+   - 输出 `ValueAt(index)`。
+   - 返回 true。
+3. 否则返回 false。
+
+#### 3.7 LeafPage::RemoveAndDeleteRecord
+
+步骤：
+
+1. 调用 `KeyIndex(key)`。
+2. 如果没找到相等 key，返回原 size 或 `-1`，但树级代码要能正确理解。
+3. 如果找到，把后面的 pair 左移覆盖当前位置。
+4. `IncreaseSize(-1)`。
+5. 返回新 size。
+
+#### 3.8 LeafPage 分裂、合并、重分配
+
+`MoveHalfTo(recipient)`：
+
+- 把当前页后一半 pair 移到新叶子页。
+- 当前页 size 减少。
+- recipient size 增加。
+- 更新叶子链表：
+
+```text
+recipient.next = this.next
+this.next = recipient.page_id
+```
+
+`MoveAllTo(recipient)`：
+
+- 把当前页所有 pair 追加到 recipient 末尾。
+- recipient 的 next 指向当前页的 next。
+
+`MoveFirstToEndOf(recipient)`：
+
+- 把当前页第一个 pair 移到 recipient 末尾。
+- 当前页删除第一个 pair。
+
+`MoveLastToFrontOf(recipient)`：
+
+- 把当前页最后一个 pair 移到 recipient 开头。
+- 当前页 size 减少。
+
+注意：叶子页移动 pair 时，不涉及孩子节点 parent 更新，因为叶子页的 value 是 RowId，不是 child page_id。
+
+### 4. InternalPage：内部页
+
+#### 4.1 内部页存什么
+
+内部页保存：
+
+```text
+key -> child_page_id
+```
+
+但是 B+ 树内部节点有一个经典问题：
+
+```text
+n 个 key 对应 n+1 个 child pointer
+```
+
+本框架为了统一 pair 数组，牺牲了第 0 个 key：
+
+```text
+pair 0: [invalid key, leftmost child]
+pair 1: [key1, child1]
+pair 2: [key2, child2]
+...
+```
+
+所以内部页的 `size_` 表示 child pointer 数量，也就是 pair 数量。真正有效 key 从 index 1 开始。
+
+#### 4.2 InternalPage::Init
+
+类似叶子页，但类型是 `INTERNAL_PAGE`。
+
+默认容量：
+
+```text
+max_size = (PAGE_SIZE - INTERNAL_PAGE_HEADER_SIZE) / (key_size + sizeof(page_id_t))
+```
+
+#### 4.3 InternalPage::Lookup
+
+目标：根据 key 找到应该进入哪个 child page。
+
+规则：
+
+```text
+ValueAt(0): keys < KeyAt(1)
+ValueAt(1): KeyAt(1) <= keys < KeyAt(2)
+ValueAt(2): KeyAt(2) <= keys < KeyAt(3)
+...
+```
+
+实现时从有效 key 范围 `[1, size - 1]` 二分：
+
+```text
+找到最后一个 KeyAt(i) <= key
+返回 ValueAt(i)
+如果所有 KeyAt(i) 都 > key，返回 ValueAt(0)
+```
+
+#### 4.4 PopulateNewRoot
+
+当旧根分裂时，需要创建新根。
+
+新根内容应该是：
+
+```text
+pair 0: invalid key, old_root_page_id
+pair 1: new_key,     new_root_child_page_id
+size = 2
+```
+
+其中 `new_key` 是右子树第一个 key。
+
+#### 4.5 InsertNodeAfter
+
+目标：在 value 等于 `old_value` 的 pair 后面插入 `(new_key, new_value)`。
+
+步骤：
+
+1. 用 `ValueIndex(old_value)` 找位置。
+2. 把后面的 pair 右移。
+3. 在 `index + 1` 写入新 key 和新 value。
+4. size 加 1。
+5. 返回新 size。
+
+#### 4.6 InternalPage 分裂
+
+内部页分裂比叶子页更绕，因为中间 key 要上推到父节点。
+
+常见策略：
+
+```text
+原内部页: [P0, K1 P1, K2 P2, K3 P3, K4 P4]
+
+分裂后:
+左页: [P0, K1 P1]
+上推: K2
+右页: [P2, K3 P3, K4 P4]
+```
+
+但本框架 pair 0 的 key 无效，所以移动到右页时要特别处理右页第 0 个 pair 的 key。
+
+简单记忆：
+
+- 内部页 split 后，右页也必须有一个无效 key 的第 0 pair。
+- 被上推到父节点的 key 不应该继续作为右页第 0 个有效 key 使用。
+- 移动 child page 到右页后，要把这些 child 的 parent_page_id 改成右页 page_id。
+
+#### 4.7 内部页移动 child 时必须更新 parent
+
+叶子页 value 是 RowId，不需要改 parent。
+
+内部页 value 是 child page id。把 child 从 A 内部页移动到 B 内部页后，child 的父亲必须变成 B：
+
+```cpp
+auto child = reinterpret_cast<BPlusTreePage *>(bpm->FetchPage(child_page_id)->GetData());
+child->SetParentPageId(recipient->GetPageId());
+bpm->UnpinPage(child_page_id, true);
+```
+
+这是实验三常见大坑。
+
+### 5. BPlusTree 整体逻辑
+
+#### 5.1 根节点在哪里
+
+`BPlusTree` 成员里有：
+
+```cpp
+page_id_t root_page_id_{INVALID_PAGE_ID};
+```
+
+并且索引根页持久化在：
+
+```text
+logical page INDEX_ROOTS_PAGE_ID = 1
+```
+
+对应类：
+
+- `IndexRootsPage`
+
+每当 root 改变，都要调用：
+
+```cpp
+UpdateRootPageId(...)
+```
+
+否则数据库重启后不知道索引根在哪。
+
+#### 5.2 构造函数
+
+构造函数需要：
+
+1. 保存 `index_id_`、`buffer_pool_manager_`、`processor_`。
+2. 设置 leaf/internal max size。
+3. 从 `INDEX_ROOTS_PAGE_ID` 读取 `IndexRootsPage`。
+4. 尝试根据 `index_id_` 获取已有 root。
+5. 如果找到，设置 `root_page_id_`。
+6. 如果找不到，保持 `INVALID_PAGE_ID`，表示空树。
+
+注意：测试里 `DBStorageEngine` 会预先分配 Catalog Meta Page 和 Index Roots Page。
+
+#### 5.3 IsEmpty
+
+最直接判断：
+
+```text
+root_page_id_ == INVALID_PAGE_ID
+```
+
+#### 5.4 FindLeafPage
+
+这是查找、插入、删除都会用到的基础函数。
+
+输入：
+
+- `key`：目标 key。
+- `page_id`：默认从 root 开始。
+- `leftMost`：是否找最左叶子。
+
+步骤：
+
+1. 如果树空，返回 `nullptr`。
+2. 如果 `page_id == INVALID_PAGE_ID`，从 `root_page_id_` 开始。
+3. Fetch 当前页。
+4. 如果是叶子页，返回这个 Page。
+   - 注意：返回时这个页保持 pinned，由调用者负责 unpin。
+5. 如果是内部页：
+   - 如果 `leftMost == true`，进入 `ValueAt(0)`。
+   - 否则调用 `internal->Lookup(key, processor_)` 找 child。
+6. unpin 当前内部页。
+7. 继续向下。
+
+这一步最重要的是：不要忘记 unpin 路径上的内部页。
+
+#### 5.5 GetValue
+
+点查流程：
+
+1. 如果空树，返回 false。
+2. 调用 `FindLeafPage(key)`。
+3. 在叶子页调用 `Lookup`。
+4. 如果找到，把 RowId 放入 `result`。
+5. unpin 叶子页。
+6. 返回是否找到。
+
+测试里 `result` 没有每次清空，所以一种稳妥做法是：找到就 `result.push_back(value)`，不要假设 result 初始为空。
+
+#### 5.6 Insert
+
+插入有两种情况：
+
+1. 空树：创建根叶子页。
+2. 非空树：插入到对应叶子页。
+
+`Insert` 顶层逻辑：
+
+```text
+if empty:
+  StartNewTree(key, value)
+  return true
+else:
+  return InsertIntoLeaf(key, value)
+```
+
+#### 5.7 StartNewTree
+
+步骤：
+
+1. 调用 `buffer_pool_manager_->NewPage(root_page_id_)`。
+2. 把 Page data 转成 `LeafPage *`。
+3. `leaf->Init(root_page_id_, INVALID_PAGE_ID, key_size, leaf_max_size_)`。
+4. 插入第一条 key-value。
+5. 调用 `UpdateRootPageId(true)`，插入 root 记录。
+6. unpin root page，dirty = true。
+
+#### 5.8 InsertIntoLeaf
+
+步骤：
+
+1. 调用 `FindLeafPage(key)`。
+2. 如果叶子页已经有相同 key，unpin 后返回 false。
+3. 调用 `leaf->Insert(key, value, processor_)`。
+4. 如果插入后 size <= max_size，unpin dirty 后返回 true。
+5. 如果溢出：
+   - 调用 `Split(leaf)` 创建新叶子页。
+   - 新叶子页第一个 key 作为上推 key。
+   - 调用 `InsertIntoParent(old_leaf, first_key_of_new_leaf, new_leaf)`。
+6. unpin 两个叶子页，dirty = true。
+7. 返回 true。
+
+#### 5.9 Split
+
+叶子页 split：
+
+1. NewPage 创建新页。
+2. 新页 Init，parent 等于旧页 parent。
+3. 调用旧页 `MoveHalfTo(new_leaf)`。
+4. 返回新页指针。
+
+内部页 split：
+
+1. NewPage 创建新内部页。
+2. Init，parent 等于旧页 parent。
+3. 调用旧页 `MoveHalfTo(new_internal, bpm)`。
+4. 返回新页指针。
+
+注意：split 后新页保持 pinned。调用者负责后续 unpin。
+
+#### 5.10 InsertIntoParent
+
+这是插入最关键的递归逻辑。
+
+如果 `old_node` 是根：
+
+1. 新建 internal root。
+2. `PopulateNewRoot(old_node->GetPageId(), key, new_node->GetPageId())`。
+3. 更新 old_node 和 new_node 的 parent 为新 root。
+4. 更新 `root_page_id_`。
+5. 调用 `UpdateRootPageId(false)`。
+
+如果 `old_node` 不是根：
+
+1. Fetch parent。
+2. 调用 `parent->InsertNodeAfter(old_node->GetPageId(), key, new_node->GetPageId())`。
+3. 设置 `new_node->parent = parent.page_id`。
+4. 如果 parent 未溢出，结束。
+5. 如果 parent 溢出：
+   - split parent。
+   - 选出要上推的 key。
+   - 递归 `InsertIntoParent(parent, push_up_key, new_parent_sibling)`。
+
+这一步最容易忘的是 parent/new_node/old_node 的 dirty unpin。
+
+### 6. 删除：Remove、Coalesce、Redistribute
+
+#### 6.1 Remove 顶层流程
+
+步骤：
+
+1. 如果树空，直接返回。
+2. 找到包含 key 的叶子页。
+3. 调用 `RemoveAndDeleteRecord`。
+4. 如果 key 不存在，unpin 返回。
+5. 如果删除后页仍然满足最小大小，unpin 返回。
+6. 如果不足，调用 `CoalesceOrRedistribute(leaf)`。
+
+根节点特殊，不用强制半满，交给 `AdjustRoot`。
+
+#### 6.2 下溢是什么
+
+B+ 树要求普通节点至少半满。
+
+如果删除后：
+
+```text
+node.size < node.GetMinSize()
+```
+
+就发生下溢，需要修复。
+
+修复方式有两种：
+
+1. Redistribute：向兄弟借一个 key。
+2. Coalesce：和兄弟合并。
+
+#### 6.3 CoalesceOrRedistribute
+
+步骤：
+
+1. 如果当前节点是根，调用 `AdjustRoot`。
+2. Fetch parent。
+3. 找到当前节点在 parent 中的位置 `index`。
+4. 选兄弟：
+   - 如果 `index == 0`，兄弟是右兄弟 `ValueAt(1)`。
+   - 否则兄弟是左兄弟 `ValueAt(index - 1)`。
+5. 如果兄弟和当前节点总 size 能放进一个页，合并。
+6. 否则重分配。
+
+常见约定：
+
+```text
+index == 0: 当前节点在最左边，使用右兄弟
+index > 0: 使用左兄弟
+```
+
+这个 index 也会影响 parent 中分隔 key 的位置。
+
+#### 6.4 Redistribute
+
+重分配就是借一个 pair。
+
+叶子页：
+
+- 如果当前节点是最左，向右兄弟借第一个 pair 到当前页末尾。
+- 否则向左兄弟借最后一个 pair 到当前页开头。
+- 更新 parent 中对应分隔 key。
+
+内部页：
+
+- 借 child pointer 时还要处理 middle key。
+- 被移动 child 的 parent_page_id 必须更新。
+- parent 中分隔 key 也要更新。
+
+#### 6.5 Coalesce
+
+合并就是把一个节点全部移动到兄弟，然后从 parent 删除对应分隔项。
+
+叶子页合并：
+
+1. 把 node 的所有 pair 移到 neighbor。
+2. 更新叶子链表 next 指针。
+3. parent 删除对应 entry。
+4. 删除 node 对应 page。
+5. 如果 parent 下溢，递归处理 parent。
+
+内部页合并：
+
+1. 从 parent 取 middle key。
+2. 把 middle key 和 node 内容合并进 neighbor。
+3. 移动的 child 都更新 parent_page_id。
+4. parent 删除 entry。
+5. 必要时递归处理 parent。
+
+#### 6.6 AdjustRoot
+
+删除可能导致 root 缩小。
+
+两种情况：
+
+1. root 是叶子页，删到 size = 0：
+   - 树变空。
+   - `root_page_id_ = INVALID_PAGE_ID`。
+   - 更新 IndexRootsPage。
+   - 删除旧 root page。
+2. root 是内部页，删到只剩一个 child：
+   - 这个唯一 child 升为新 root。
+   - child parent 设置为 `INVALID_PAGE_ID`。
+   - 更新 root_page_id。
+   - 删除旧 root page。
+
+### 7. IndexIterator
+
+#### 7.1 为什么需要索引迭代器
+
+B+ 树叶子节点是有序链表，所以天然适合范围查询。
+
+例如：
+
+```sql
+where id >= 10 and id < 100
+```
+
+可以：
+
+1. 找到第一个 `id >= 10` 的叶子位置。
+2. 沿叶子链表一直扫。
+3. 到 `id >= 100` 停止。
+
+本项目中的 `BPlusTreeIndex::ScanKey` 已经使用 `IndexIterator` 实现 `>`, `>=`, `<`, `<=`, `<>` 等比较。
+
+#### 7.2 IndexIterator 成员
+
+已有成员：
+
+```cpp
+page_id_t current_page_id;
+LeafPage *page;
+int item_index;
+BufferPoolManager *buffer_pool_manager;
+```
+
+构造函数会 fetch 当前叶子页，因此析构函数要 unpin 当前页。
+
+#### 7.3 operator*
+
+返回当前 pair：
+
+```cpp
+return page->GetItem(item_index);
+```
+
+需要确保当前不是 end。
+
+#### 7.4 operator++
+
+步骤：
+
+1. `item_index++`。
+2. 如果仍然小于 `page->GetSize()`，停在当前页。
+3. 如果到达当前页末尾：
+   - 记录 `next_page_id = page->GetNextPageId()`。
+   - unpin 当前页。
+   - 如果 next 是 `INVALID_PAGE_ID`，设置为 end。
+   - 否则 fetch next leaf，`item_index = 0`。
+
+end 可以表示为：
+
+```text
+current_page_id = INVALID_PAGE_ID
+item_index = 0
+page = nullptr
+```
+
+#### 7.5 Begin 和 End
+
+`BPlusTree::Begin()`：
+
+- 找最左叶子页。
+- 返回指向第 0 个 item 的 iterator。
+- 如果树空，返回 `End()`。
+
+`BPlusTree::Begin(key)`：
+
+- 找 key 所在叶子。
+- 用 `LeafPage::KeyIndex(key)` 得到起始 index。
+- 如果 index 等于当前页 size，应该跳到下一叶子页的开头。
+
+`BPlusTree::End()`：
+
+- 返回默认构造的 `IndexIterator()`，即 invalid page。
+
+### 8. BPlusTreeIndex 封装
+
+`BPlusTreeIndex` 已经基本实现，它把上层传来的 `Row key` 转为 `GenericKey`，再调用 `BPlusTree`。
+
+重要接口：
+
+```cpp
+InsertEntry(row_key, row_id, txn)
+RemoveEntry(row_key, row_id, txn)
+ScanKey(row_key, result, txn, compare_operator)
+```
+
+`ScanKey` 支持：
+
+```text
+=
+>
+>=
+<
+<=
+<>
+```
+
+这些范围查询依赖：
+
+- `BPlusTree::Begin()`
+- `BPlusTree::Begin(key)`
+- `BPlusTree::End()`
+- `IndexIterator::operator++`
+- `IndexIterator::operator*`
+
+所以即使点查通过，迭代器没写好，`BPlusTreeIndexSimpleTest` 仍然会失败。
+
+### 9. 测试怎么理解
+
+#### 9.1 b_plus_tree_test.cpp
+
+测试做了这些事：
+
+1. 创建单列 int key 的 B+ 树。
+2. 随机插入 2000 个 key。
+3. 检查所有页最终都 unpinned。
+4. 逐个 key 查询。
+5. 删除一半 key。
+6. 检查被删 key 查不到，未删 key 查得到。
+
+这主要验证：
+
+- 插入时 split 正确。
+- root 分裂正确。
+- 查找路径正确。
+- 删除、合并、重分配正确。
+- BufferPool pin/unpin 没泄漏。
+
+#### 9.2 b_plus_tree_index_test.cpp
+
+分两部分：
+
+1. `BPlusTreeIndexGenericKeyTest`
+   - 验证复合 key 序列化比较正确。
+   - 依赖实验二的 Row 序列化。
+2. `BPlusTreeIndexSimpleTest`
+   - 插入 10 条复合 key。
+   - 用 `ScanKey("=")` 查询。
+   - 用 iterator 从头扫到尾。
+
+这里会检验 B+ 树和索引封装是否能一起工作。
+
+#### 9.3 index_iterator_test.cpp
+
+流程：
+
+1. 插入 1 到 50。
+2. 删除偶数。
+3. 确认偶数查不到，奇数查得到。
+4. 用 iterator 顺序遍历。
+5. 期待遍历结果是 1, 3, 5, ..., 49。
+
+这会重点检查：
+
+- 删除后叶子链表仍然正确。
+- iterator 能跨叶子页。
+- key 顺序仍然正确。
+
+### 10. 推荐实现顺序
+
+B+ 树很容易写乱。建议严格按层次来：
+
+1. 实现 `BPlusTreePage` 的基础 getter/setter。
+2. 实现 `LeafPage`：
+   - `Init`
+   - `KeyIndex`
+   - `Insert`
+   - `Lookup`
+   - `RemoveAndDeleteRecord`
+   - `MoveHalfTo`
+3. 实现 `InternalPage`：
+   - `Init`
+   - `Lookup`
+   - `PopulateNewRoot`
+   - `InsertNodeAfter`
+   - `Remove`
+4. 实现 B+ 树只插入不删除：
+   - `IsEmpty`
+   - `FindLeafPage`
+   - `GetValue`
+   - `StartNewTree`
+   - `Insert`
+   - `InsertIntoLeaf`
+   - `Split`
+   - `InsertIntoParent`
+5. 先用小数据手测插入和查询。
+6. 实现 `IndexIterator` 和 `Begin/End`。
+7. 再实现删除：
+   - `Remove`
+   - `AdjustRoot`
+   - `CoalesceOrRedistribute`
+   - `Redistribute`
+   - `Coalesce`
+8. 最后跑完整 index 测试。
+
+建议测试命令：
+
+```bash
+make b_plus_tree_test -j
+./test/b_plus_tree_test
+
+make b_plus_tree_index_test -j
+./test/b_plus_tree_index_test
+
+make index_iterator_test -j
+./test/index_iterator_test
+```
+
+如果已经构建过，只改 `.cpp/.h`，通常不需要重新 `cmake ..`。
+
+### 11. 调试建议
+
+#### 11.1 从小阶数开始
+
+默认页很大，节点容量很大，插入很多数据才会 split。调试时可以显式传小一点的 max size：
+
+```cpp
+BPlusTree tree(index_id, bpm, key_manager, 3, 4);
+```
+
+这样插入几个 key 就能触发 split、root split、merge。
+
+#### 11.2 画树
+
+框架提供：
+
+```cpp
+tree.PrintTree(out, schema);
+```
+
+它会输出 DOT 格式，可以拿去 Graphviz 可视化。调 B+ 树时，画图比盯变量更有效。
+
+#### 11.3 每个 Fetch 都找对应 Unpin
+
+实验三最常见的问题不是逻辑错，而是页面 pin 泄漏。
+
+经验规则：
+
+```text
+FetchPage / NewPage 得到的页，都要明确谁负责 UnpinPage。
+```
+
+测试中 `tree.Check()` 会调用：
+
+```cpp
+buffer_pool_manager_->CheckAllUnpinned()
+```
+
+如果失败，说明有页没释放。
+
+### 12. 常见错误清单
+
+1. 内部页从 index 0 开始比较 key，忘记第 0 个 key 是 invalid。
+2. split 内部页时，把上推 key 继续留在右页有效 key 位置。
+3. 移动内部页 child 后，忘记更新 child 的 parent_page_id。
+4. 叶子页 split 后，忘记维护 next_page_id。
+5. root 改变后，忘记调用 `UpdateRootPageId`。
+6. `FindLeafPage` 返回叶子页后，调用者忘记 unpin。
+7. `GetValue` 找到 key 后没有把 RowId push 到 result。
+8. `Insert` 对重复 key 没有返回 false。
+9. `InsertIntoParent` 没有递归处理 parent overflow。
+10. 删除后节点下溢，没有做 redistribute 或 coalesce。
+11. coalesce 后删除了错误的 parent entry。
+12. iterator 到达叶子页末尾后，没有跳到 next leaf。
+13. `Begin(key)` 落在页末尾时，没有跳到下一页。
+14. `IndexIterator` 析构时重复 unpin 或忘记 unpin。
+15. `Destroy` 删除树页时，只删 root，忘记递归删除所有 child。
+
+### 13. 验收问答准备
+
+问题：为什么数据库索引常用 B+ 树，而不是普通二叉搜索树？
+
+回答要点：B+ 树节点 fanout 很大，树高低，适合磁盘页读写。二叉树高度太高，随机 I/O 次数多，不适合数据库。
+
+问题：B+ 树为什么适合范围查询？
+
+回答要点：所有数据项都在叶子页，叶子页按 key 有序并通过 next 指针连接。找到范围起点后，可以沿叶子链表顺序扫描。
+
+问题：内部页第 0 个 key 为什么无效？
+
+回答要点：内部节点有 n 个 key 和 n+1 个 child pointer。框架用 pair 数组统一存储，为了让每个 child pointer 都跟一个 pair 绑定，第 0 个 pair 只使用 value，key 作为无效占位。
+
+问题：索引叶子页为什么存 RowId？
+
+回答要点：RowId 能定位堆表中的完整记录。索引只存 key 和 RowId，可以减少索引大小，提高 fanout，需要完整记录时再回表。
+
+问题：插入导致叶子页满了怎么办？
+
+回答要点：创建新叶子页，把一半 key 移过去，维护叶子链表，把新叶子页第一个 key 插入父节点。如果父节点也满，继续向上分裂，必要时创建新根。
+
+问题：删除导致节点太空怎么办？
+
+回答要点：先看兄弟节点是否能借一个 key，能借就 redistribute；不能借就 coalesce 合并，并从父节点删除分隔项。父节点如果下溢，递归处理。
+
+问题：为什么 root 可以不满足普通节点的半满约束？
+
+回答要点：root 是树入口。空树、只有一个叶子根、或内部根只有两个孩子都是合法状态。删除时 root 还可能收缩，把唯一 child 提升为新 root。
+
+问题：BPlusTreeIndex 和 BPlusTree 的关系是什么？
+
+回答要点：`BPlusTree` 只处理 `GenericKey -> RowId` 的树结构；`BPlusTreeIndex` 是上层索引接口，负责把 `Row key` 序列化成 `GenericKey`，并支持不同比较操作的扫描。
