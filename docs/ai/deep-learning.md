@@ -1,478 +1,1502 @@
+<!-- learning-notes
+course: 深度学习
+textbook: 《深度学习入门》；《深度学习》
+style: exam-review
+source_policy: references-section
+last_updated: 2026-05-26
+-->
+
 # 深度学习
 
-## 一、神经网络基础
-### 1.1 逻辑回归：单层神经网络入门
-逻辑回归是用于二分类任务的基础模型，可视为只有输出层的单层神经网络。
+深度学习（Deep Learning）用多层可微函数从数据中学习表示。它的核心不是“层数越多越好”，而是通过**表示学习、反向传播、梯度优化、正则化和大规模数据/算力**，让模型自动学习从低级特征到高级语义的映射。
 
-#### 核心公式
-- 线性变换：\(z = w^T x + b\)，其中\(w\)为权重向量，\(b\)为偏置，\(x\)为输入特征
-- 激活函数（Sigmoid）：\(\hat{y} = \sigma(z) = \frac{1}{1 + e^{-z}}\)，将输出映射到(0,1)区间，表示样本属于正类的概率
-- 损失函数（交叉熵损失）：\(L(\hat{y}, y) = -[y \log\hat{y} + (1-y)\log(1-\hat{y})]\)
-- 成本函数（全体样本损失均值）：\(J(w,b) = \frac{1}{m}\sum_{i=1}^m L(\hat{y}^{(i)}, y^{(i)})\)
+!!! tip "复习抓手"
+    深度学习可以用一条链路串起来：**张量表示数据，网络定义函数，损失衡量错误，反向传播计算梯度，优化器更新参数，正则化和归一化保证泛化与稳定训练。**
 
-#### Python代码实现（Numpy）
-```python
-import numpy as np
+## 一、课程地图与深度学习总览
 
-def sigmoid(z):
-    """实现Sigmoid激活函数"""
-    return 1 / (1 + np.exp(-z))
+### 1.1 深度学习和传统机器学习的关系
 
-def forward_propagation(X, w, b):
-    """前向传播计算预测值"""
-    z = np.dot(w.T, X) + b
-    y_hat = sigmoid(z)
-    return y_hat
-
-def compute_cost(y_hat, y):
-    """计算交叉熵损失"""
-    m = y.shape[1]
-    cost = -1/m * np.sum(y * np.log(y_hat) + (1 - y) * np.log(1 - y_hat))
-    return np.squeeze(cost)  # 压缩维度为标量
-```
-
-### 1.2 梯度下降：参数优化方法
-梯度下降通过迭代更新模型参数，最小化成本函数。核心是计算损失对参数的偏导数，沿负梯度方向更新参数。
-
-#### 核心公式
-参数更新规则：
-\(w = w - \alpha \frac{\partial J(w,b)}{\partial w}\)
-\(b = b - \alpha \frac{\partial J(w,b)}{\partial b}\)
-其中\(\alpha\)为学习率，控制每一步的更新幅度。
-
-#### Python代码实现（逻辑回归的梯度计算与更新）
-```python
-def compute_gradient(X, y, y_hat):
-    """计算损失对w和b的梯度"""
-    m = X.shape[1]
-    dw = 1/m * np.dot(X, (y_hat - y).T)
-    db = 1/m * np.sum(y_hat - y)
-    return dw, db
-
-def gradient_descent(X, y, w, b, learning_rate, num_iterations):
-    """梯度下降迭代优化参数"""
-    costs = []
-    for i in range(num_iterations):
-        y_hat = forward_propagation(X, w, b)
-        cost = compute_cost(y_hat, y)
-        dw, db = compute_gradient(X, y, y_hat)
-        
-        # 更新参数
-        w -= learning_rate * dw
-        b -= learning_rate * db
-        
-        # 记录损失
-        if i % 100 == 0:
-            costs.append(cost)
-            print(f"迭代次数 {i}, 成本 {cost:.4f}")
-    return w, b, costs
-```
-
-### 1.3 反向传播：梯度计算的核心逻辑
-反向传播是通过链式法则从输出层到输入层逐层计算梯度的过程，是深度学习模型参数更新的核心步骤。对于逻辑回归，反向传播的过程已包含在上述梯度计算中；对于深层网络，反向传播会逐层传递梯度信号。
-
----
-
-## 二、深层神经网络
-### 2.1 深层网络的基本结构
-深层神经网络包含输入层、多个隐藏层和输出层，每层神经元通过激活函数引入非线性，使模型能学习复杂的特征映射。
-
-#### 核心概念
-- 层数定义：L层网络包含L-1个隐藏层 + 1个输出层
-- 前向传播递推：对于第\(l\)层，\(Z^{[l]} = W^{[l]}A^{[l-1]} + b^{[l]}\)，\(A^{[l]} = g^{[l]}(Z^{[l]})\)，其中\(g^{[l]}\)为第\(l\)层的激活函数，\(A^{[0]} = X\)为输入
-
-#### Python代码实现（L层网络前向传播）
-```python
-def initialize_parameters_deep(layer_dims):
-    """初始化深层网络的权重和偏置"""
-    parameters = {}
-    L = len(layer_dims)  # 网络总层数（含输入层）
-    
-    for l in range(1, L):
-        parameters[f"W{l}"] = np.random.randn(layer_dims[l], layer_dims[l-1]) * 0.01
-        parameters[f"b{l}"] = np.zeros((layer_dims[l], 1))
-    return parameters
-
-def linear_activation_forward(A_prev, W, b, activation):
-    """单一层的线性变换+激活函数"""
-    Z = np.dot(W, A_prev) + b
-    if activation == "sigmoid":
-        A = sigmoid(Z)
-    elif activation == "relu":
-        A = np.maximum(0, Z)  # ReLU激活函数
-    return A, (Z, A_prev, W, b)  # 缓存中间结果，用于反向传播
-
-def L_model_forward(X, parameters):
-    """L层网络的完整前向传播"""
-    caches = []
-    A = X
-    L = len(parameters) // 2  # 网络的隐藏层+输出层数量
-    
-    # 前L-1层使用ReLU激活
-    for l in range(1, L):
-        A_prev = A
-        A, cache = linear_activation_forward(A_prev, parameters[f"W{l}"], parameters[f"b{l}"], activation="relu")
-        caches.append(cache)
-    
-    # 输出层使用Sigmoid激活（二分类任务）
-    AL, cache = linear_activation_forward(A, parameters[f"W{L}"], parameters[f"b{L}"], activation="sigmoid")
-    caches.append(cache)
-    return AL, caches
-```
-
-### 2.2 常用激活函数
-不同激活函数的特性直接影响模型的训练效率和表达能力，常见激活函数对比：
-
-| 激活函数 | 公式 | 优点 | 缺点 | 代码实现 |
-| --- | --- | --- | --- | --- |
-| Sigmoid | \(\sigma(z) = \frac{1}{1+e^{-z}}\) | 输出在(0,1)，可表示概率 | 易出现梯度消失，输出非零均值 | `def sigmoid(z): return 1/(1+np.exp(-z))` |
-| Tanh | \(\tanh(z) = \frac{e^z - e^{-z}}{e^z + e^{-z}}\) | 输出零均值，缓解Sigmoid的部分问题 | 仍易梯度消失 | `def tanh(z): return np.tanh(z)` |
-| ReLU | \(ReLU(z) = \max(0, z)\) | 解决梯度消失问题，计算高效 | 部分神经元可能永久失活 | `def relu(z): return np.maximum(0, z)` |
-| Leaky ReLU | \(LeakyReLU(z) = \max(\alpha z, z)\) | 解决ReLU的神经元失活问题 | 引入额外超参数\(\alpha\) | `def leaky_relu(z, alpha=0.01): return np.maximum(alpha*z, z)` |
-
-### 2.3 深层网络的反向传播
-反向传播通过链式法则逐层计算梯度，核心是根据前向传播的缓存结果，递推计算每层的\(\frac{\partial J}{\partial W^{[l]}}\)和\(\frac{\partial J}{\partial b^{[l]}}\)。
-
-#### Python代码实现（L层网络反向传播）
-```python
-def linear_activation_backward(dA, cache, activation):
-    """单一层的反向传播（激活函数梯度+线性变换梯度）"""
-    Z, A_prev, W, b = cache
-    m = A_prev.shape[1]
-    
-    if activation == "sigmoid":
-        dZ = dA * sigmoid(Z) * (1 - sigmoid(Z))
-    elif activation == "relu":
-        dZ = np.array(dA, copy=True)
-        dZ[Z <= 0] = 0  # ReLU导数：Z>0时为1，Z<=0时为0
-    
-    dW = 1/m * np.dot(dZ, A_prev.T)
-    db = 1/m * np.sum(dZ, axis=1, keepdims=True)
-    dA_prev = np.dot(W.T, dZ)
-    return dA_prev, dW, db
-
-def L_model_backward(AL, Y, caches):
-    """L层网络的完整反向传播"""
-    grads = {}
-    L = len(caches)
-    m = AL.shape[1]
-    Y = Y.reshape(AL.shape)
-    
-    # 输出层初始梯度
-    dAL = - (np.divide(Y, AL) - np.divide(1 - Y, 1 - AL))
-    
-    # 输出层反向传播（Sigmoid激活）
-    current_cache = caches[-1]
-    grads[f"dA{L-1}"], grads[f"dW{L}"], grads[f"db{L}"] = linear_activation_backward(dAL, current_cache, activation="sigmoid")
-    
-    # 隐藏层反向传播（ReLU激活）
-    for l in reversed(range(L-1)):
-        current_cache = caches[l]
-        dA_prev_temp, dW_temp, db_temp = linear_activation_backward(grads[f"dA{l+1}"], current_cache, activation="relu")
-        grads[f"dA{l}"] = dA_prev_temp
-        grads[f"dW{l+1}"] = dW_temp
-        grads[f"db{l+1}"] = db_temp
-    return grads
-```
-
----
-
-## 三、卷积神经网络（CNN）
-卷积神经网络通过卷积、池化等操作提取空间特征，是计算机视觉任务的核心模型。
-
-### 3.1 卷积操作
-卷积操作通过滑动卷积核（Filter）对输入特征图进行局部加权求和，提取局部空间特征。
-
-#### 核心参数
-- 卷积核大小（f）：通常为3x3、5x5
-- 步幅（s）：卷积核每次滑动的像素数
-- 填充（p）：在输入特征图边缘补零，保持输出尺寸与输入一致
-
-#### Python代码实现（Numpy手动实现卷积）
-```python
-def conv_single_step(a_slice_prev, W, b):
-    """单步卷积计算"""
-    s = np.multiply(a_slice_prev, W)
-    Z = np.sum(s) + float(b)
-    return Z
-
-def conv_forward(A_prev, W, b, hparameters):
-    """多通道输入的卷积前向传播"""
-    (m, n_H_prev, n_W_prev, n_C_prev) = A_prev.shape
-    (f, f, n_C_prev, n_C) = W.shape
-    stride = hparameters["stride"]
-    pad = hparameters["pad"]
-    
-    # 计算输出尺寸
-    n_H = int((n_H_prev - f + 2*pad) / stride) + 1
-    n_W = int((n_W_prev - f + 2*pad) / stride) + 1
-    
-    # 初始化输出特征图
-    Z = np.zeros((m, n_H, n_W, n_C))
-    A_prev_pad = np.pad(A_prev, ((0,0), (pad,pad), (pad,pad), (0,0)), mode='constant')
-    
-    for i in range(m):
-        a_prev_pad = A_prev_pad[i]
-        for h in range(n_H):
-            for w in range(n_W):
-                for c in range(n_C):
-                    # 定位当前卷积窗口
-                    vert_start = h * stride
-                    vert_end = vert_start + f
-                    horiz_start = w * stride
-                    horiz_end = horiz_start + f
-                    a_slice_prev = a_prev_pad[vert_start:vert_end, horiz_start:horiz_end, :]
-                    Z[i, h, w, c] = conv_single_step(a_slice_prev, W[...,c], b[...,c])
-    return Z
-```
-
-### 3.2 池化层
-池化层用于降低特征图的空间尺寸，减少计算量，同时保留关键特征。常见类型为最大池化和平均池化。
-
-#### Python代码实现
-```python
-def pool_forward(A_prev, hparameters, mode="max"):
-    """池化层前向传播"""
-    (m, n_H_prev, n_W_prev, n_C_prev) = A_prev.shape
-    f = hparameters["f"]
-    stride = hparameters["stride"]
-    
-    n_H = int((n_H_prev - f) / stride) + 1
-    n_W = int((n_W_prev - f) / stride) + 1
-    n_C = n_C_prev
-    
-    A = np.zeros((m, n_H, n_W, n_C))
-    
-    for i in range(m):
-        for h in range(n_H):
-            for w in range(n_W):
-                for c in range(n_C):
-                    vert_start = h * stride
-                    vert_end = vert_start + f
-                    horiz_start = w * stride
-                    horiz_end = horiz_start + f
-                    
-                    a_slice_prev = A_prev[i, vert_start:vert_end, horiz_start:horiz_end, c]
-                    if mode == "max":
-                        A[i, h, w, c] = np.max(a_slice_prev)
-                    elif mode == "average":
-                        A[i, h, w, c] = np.mean(a_slice_prev)
-    return A
-```
-
-### 3.3 典型CNN架构实现（PyTorch）
-以ResNet的残差模块为例，残差连接解决了深层网络的梯度消失问题：
-
-```python
-import torch
-import torch.nn as nn
-import torch.nn.functional as F
-
-class ResidualBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, stride=1):
-        super(ResidualBlock, self).__init__()
-        self.conv1 = nn.Conv2d(in_channels, out_channels, kernel_size=3, stride=stride, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.conv2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn2 = nn.BatchNorm2d(out_channels)
-        
-        # 捷径连接：当输入输出通道数不同或步幅不为1时，用1x1卷积调整
-        self.shortcut = nn.Sequential()
-        if stride != 1 or in_channels != out_channels:
-            self.shortcut = nn.Sequential(
-                nn.Conv2d(in_channels, out_channels, kernel_size=1, stride=stride, bias=False),
-                nn.BatchNorm2d(out_channels)
-            )
-    
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.bn2(self.conv2(out))
-        out += self.shortcut(x)
-        out = F.relu(out)
-        return out
-
-# 构建简单的ResNet18
-class ResNet(nn.Module):
-    def __init__(self, block, num_blocks, num_classes=10):
-        super(ResNet, self).__init__()
-        self.in_channels = 64
-        self.conv1 = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1, bias=False)
-        self.bn1 = nn.BatchNorm2d(64)
-        self.layer1 = self._make_layer(block, 64, num_blocks[0], stride=1)
-        self.layer2 = self._make_layer(block, 128, num_blocks[1], stride=2)
-        self.layer3 = self._make_layer(block, 256, num_blocks[2], stride=2)
-        self.layer4 = self._make_layer(block, 512, num_blocks[3], stride=2)
-        self.avg_pool = nn.AdaptiveAvgPool2d((1,1))
-        self.fc = nn.Linear(512, num_classes)
-    
-    def _make_layer(self, block, out_channels, num_blocks, stride):
-        strides = [stride] + [1]*(num_blocks-1)
-        layers = []
-        for stride in strides:
-            layers.append(block(self.in_channels, out_channels, stride))
-            self.in_channels = out_channels
-        return nn.Sequential(*layers)
-    
-    def forward(self, x):
-        out = F.relu(self.bn1(self.conv1(x)))
-        out = self.layer1(out)
-        out = self.layer2(out)
-        out = self.layer3(out)
-        out = self.layer4(out)
-        out = self.avg_pool(out)
-        out = out.view(out.size(0), -1)
-        out = self.fc(out)
-        return out
-
-# 实例化ResNet18
-def ResNet18(num_classes=10):
-    return ResNet(ResidualBlock, [2,2,2,2], num_classes)
-```
-
----
-
-## 四、循环神经网络（RNN）与序列模型
-循环神经网络专门用于处理序列数据，通过循环单元保留上下文信息。
-
-### 4.1 基础RNN结构
-基础RNN的循环单元会接收当前输入和上一时刻的隐藏状态，输出当前隐藏状态和预测结果。
-
-#### 核心公式
-- 隐藏状态更新：\(h_t = \tanh(W_{hh} h_{t-1} + W_{xh} x_t + b_h)\)
-- 输出计算：\(y_t = W_{hy} h_t + b_y\)
-
-#### Python代码实现（Numpy）
-```python
-def softmax(x):
-    """Softmax激活函数"""
-    e_x = np.exp(x - np.max(x))
-    return e_x / e_x.sum(axis=0)
-
-def rnn_cell_forward(xt, a_prev, parameters):
-    """单步RNN单元前向传播"""
-    Wax = parameters["Wax"]
-    Waa = parameters["Waa"]
-    Wya = parameters["Wya"]
-    ba = parameters["ba"]
-    by = parameters["by"]
-    
-    a_next = np.tanh(np.dot(Wax, xt) + np.dot(Waa, a_prev) + ba)
-    yt_pred = softmax(np.dot(Wya, a_next) + by)  # softmax用于多分类输出
-    return a_next, yt_pred
-
-def rnn_forward(x, a0, parameters):
-    """完整序列的RNN前向传播"""
-    (n_x, m, T_x) = x.shape
-    (n_a, m) = a0.shape
-    n_y = parameters["Wya"].shape[0]
-    
-    # 初始化隐藏状态和输出缓存
-    a = np.zeros((n_a, m, T_x))
-    y_pred = np.zeros((n_y, m, T_x))
-    a_next = a0
-    
-    for t in range(T_x):
-        a_next, yt_pred = rnn_cell_forward(x[:,:,t], a_next, parameters)
-        a[:,:,t] = a_next
-        y_pred[:,:,t] = yt_pred
-    return a, y_pred
-```
-
-### 4.2 LSTM单元实现（PyTorch）
-LSTM通过遗忘门、输入门、输出门精准控制上下文信息的流动，解决了基础RNN的长期依赖问题：
-
-```python
-class LSTMCell(nn.Module):
-    def __init__(self, input_size, hidden_size):
-        super(LSTMCell, self).__init__()
-        self.hidden_size = hidden_size
-        # 合并所有门的权重矩阵，减少计算量
-        self.fc = nn.Linear(input_size + hidden_size, 4 * hidden_size)
-    
-    def forward(self, x, hidden):
-        h_prev, c_prev = hidden
-        combined = torch.cat((x, h_prev), dim=1)
-        gates = self.fc(combined)
-        # 拆分四个门：遗忘门(f)、输入门(i)、候选细胞状态(g)、输出门(o)
-        f, i, g, o = torch.chunk(gates, 4, dim=1)
-        
-        f = torch.sigmoid(f)
-        i = torch.sigmoid(i)
-        g = torch.tanh(g)
-        o = torch.sigmoid(o)
-        
-        # 更新细胞状态
-        c_next = f * c_prev + i * g
-        # 更新隐藏状态
-        h_next = o * torch.tanh(c_next)
-        return h_next, c_next
-
-# 简单的LSTM序列分类模型
-class LSTMClassifier(nn.Module):
-    def __init__(self, input_size, hidden_size, num_classes, num_layers=1):
-        super(LSTMClassifier, self).__init__()
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-        self.lstm = nn.LSTM(input_size, hidden_size, num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, num_classes)
-    
-    def forward(self, x):
-        # 初始化隐藏状态和细胞状态
-        h0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        c0 = torch.zeros(self.num_layers, x.size(0), self.hidden_size).to(x.device)
-        
-        # LSTM前向传播，输出为(output, (hn, cn))
-        out, _ = self.lstm(x, (h0, c0))
-        # 取最后一个时间步的隐藏状态用于分类
-        out = self.fc(out[:, -1, :])
-        return out
-```
-
----
-
-## 五、模型训练与调优
-### 5.1 正则化方法
-- Dropout：随机失活部分神经元，防止过拟合，PyTorch实现：`nn.Dropout(p=0.5)`
-- L2正则化：在损失函数中加入权重平方项，PyTorch中通过优化器的`weight_decay`参数实现
-- 数据增强：对输入数据进行随机变换（如图片翻转、裁剪），增加数据多样性
-
-### 5.2 常见优化器对比
-| 优化器 | 核心特点 | PyTorch实现 |
+| 维度 | 传统机器学习 | 深度学习 |
 | --- | --- | --- |
-| SGD | 基础梯度下降，学习率固定 | `torch.optim.SGD(model.parameters(), lr=0.01)` |
-| Momentum | 引入动量，加速收敛，缓解震荡 | `torch.optim.SGD(model.parameters(), lr=0.01, momentum=0.9)` |
-| Adam | 自适应学习率，结合动量与RMSprop | `torch.optim.Adam(model.parameters(), lr=0.001)` |
+| 特征 | 依赖人工特征工程 | 自动学习多层表示 |
+| 模型 | 线性模型、树、SVM、浅层模型 | MLP、CNN、RNN、Transformer |
+| 数据需求 | 中小数据也常有效 | 通常更依赖大量数据 |
+| 可解释性 | 较强 | 较弱，需要可视化和分析工具 |
+| 计算需求 | 相对低 | GPU/TPU 加速常见 |
 
-### 5.3 训练循环示例（PyTorch）
+```text
+输入数据
+  -> 低层特征: 边缘、词片段、局部模式
+  -> 中层特征: 形状、短语、局部结构
+  -> 高层特征: 物体、语义、任务相关表示
+  -> 输出: 分类、回归、生成、决策
+```
+
+### 1.2 深度学习常见任务
+
+| 任务 | 输出 | 典型模型 |
+| --- | --- | --- |
+| 图像分类 | 类别 | CNN、ViT |
+| 目标检测 | 框 + 类别 | Faster R-CNN、YOLO |
+| 语义分割 | 每个像素类别 | FCN、U-Net、DeepLab |
+| 文本分类 | 类别 | RNN、CNN、Transformer |
+| 序列标注 | 每个 token 标签 | BiLSTM-CRF、BERT |
+| 机器翻译 | 目标语言序列 | Seq2Seq、Transformer |
+| 生成建模 | 新样本 | VAE、GAN、Diffusion |
+| 推荐系统 | 点击/评分/排序 | Embedding、DNN、Wide&Deep |
+
+### 1.3 深度学习训练闭环
+
+```text
+Dataset -> DataLoader -> Model -> Loss
+                         ^       |
+                         |       v
+                    Optimizer <- Gradients
+```
+
+训练过程：
+
+1. 前向传播计算预测。
+2. 损失函数计算预测与标签的差距。
+3. 反向传播计算参数梯度。
+4. 优化器更新参数。
+5. 在验证集上评估泛化性能。
+
+### 1.4 张量维度习惯
+
+| 数据类型 | 常见张量形状 |
+| --- | --- |
+| 表格数据 | `(batch_size, num_features)` |
+| 灰度图像 | `(batch_size, 1, height, width)` |
+| RGB 图像 | `(batch_size, 3, height, width)` |
+| 文本 token | `(batch_size, seq_len)` |
+| 序列嵌入 | `(batch_size, seq_len, hidden_size)` |
+| 分类输出 logits | `(batch_size, num_classes)` |
+
+!!! warning "维度是深度学习调试第一现场"
+    如果模型报错，先打印每一层输入输出 shape。多数初学问题不是公式错，而是 batch、channel、seq_len 或 hidden_size 顺序错。
+
+## 二、数学基础与张量计算
+
+### 2.1 标量、向量、矩阵、张量
+
+| 对象 | 例子 | 维度 |
+| --- | --- | --- |
+| 标量 | \(x=3\) | 0D |
+| 向量 | \(x=[1,2,3]^T\) | 1D |
+| 矩阵 | \(X\in \mathbb{R}^{m\times n}\) | 2D |
+| 张量 | 图像 batch \(N\times C\times H\times W\) | 多维 |
+
+### 2.2 线性变换
+
+全连接层本质是仿射变换：
+
+\[
+Z = XW + b
+\]
+
+若：
+
+- \(X \in \mathbb{R}^{m\times d}\)
+- \(W \in \mathbb{R}^{d\times h}\)
+- \(b \in \mathbb{R}^{h}\)
+
+则：
+
+\[
+Z \in \mathbb{R}^{m\times h}
+\]
+
+### 2.3 常用范数
+
+L1 范数：
+
+\[
+\|x\|_1 = \sum_i |x_i|
+\]
+
+L2 范数：
+
+\[
+\|x\|_2 = \sqrt{\sum_i x_i^2}
+\]
+
+Frobenius 范数：
+
+\[
+\|W\|_F = \sqrt{\sum_i\sum_j W_{ij}^2}
+\]
+
+正则化中常用 L2：
+
+\[
+J_{reg}=J+\frac{\lambda}{2}\|W\|_2^2
+\]
+
+### 2.4 概率输出
+
+二分类常用 Sigmoid：
+
+\[
+\sigma(z)=\frac{1}{1+e^{-z}}
+\]
+
+多分类常用 Softmax：
+
+\[
+softmax(z)_i = \frac{e^{z_i}}{\sum_{j=1}^{K}e^{z_j}}
+\]
+
+数值稳定写法：
+
+\[
+softmax(z)_i = \frac{e^{z_i-\max(z)}}{\sum_{j=1}^{K}e^{z_j-\max(z)}}
+\]
+
+## 三、神经网络基础
+
+### 3.1 单个神经元
+
+神经元做两步：
+
+\[
+z=w^Tx+b
+\]
+
+\[
+a=g(z)
+\]
+
+其中：
+
+- \(w\)：权重。
+- \(b\)：偏置。
+- \(g\)：激活函数。
+- \(a\)：激活值。
+
+```text
+x1 ---- w1 \
+x2 ---- w2  +--> z = w^T x + b --> activation --> a
+x3 ---- w3 /
+```
+
+### 3.2 逻辑回归是单层神经网络
+
+二分类逻辑回归：
+
+\[
+z=w^Tx+b
+\]
+
+\[
+\hat{y}=\sigma(z)
+\]
+
+单样本交叉熵：
+
+\[
+L(\hat{y},y)=-[y\log\hat{y}+(1-y)\log(1-\hat{y})]
+\]
+
+整体代价：
+
+\[
+J(w,b)=\frac{1}{m}\sum_{i=1}^{m}L(\hat{y}^{(i)},y^{(i)})
+\]
+
+### 3.3 多层感知机
+
+第 \(l\) 层：
+
+\[
+Z^{[l]} = W^{[l]}A^{[l-1]}+b^{[l]}
+\]
+
+\[
+A^{[l]} = g^{[l]}(Z^{[l]})
+\]
+
+其中：
+
+\[
+A^{[0]}=X
+\]
+
+对于 \(L\) 层网络：
+
+```text
+X = A[0]
+  -> Linear + Activation -> A[1]
+  -> Linear + Activation -> A[2]
+  -> ...
+  -> Linear + Output Activation -> A[L]
+```
+
+### 3.4 常用激活函数
+
+| 激活函数 | 公式 | 优点 | 缺点 |
+| --- | --- | --- | --- |
+| Sigmoid | \(\sigma(z)=\frac{1}{1+e^{-z}}\) | 可解释为概率 | 梯度消失、非零均值 |
+| Tanh | \(\tanh(z)\) | 零均值 | 仍可能梯度消失 |
+| ReLU | \(\max(0,z)\) | 简单、高效、缓解梯度消失 | 可能死亡 ReLU |
+| Leaky ReLU | \(\max(\alpha z,z)\) | 负半轴仍有梯度 | 多一个超参数 |
+| GELU | \(x\Phi(x)\) | Transformer 常用 | 计算稍复杂 |
+
+ReLU 导数：
+
+\[
+\frac{d}{dz}ReLU(z)=
+\begin{cases}
+1, & z>0 \\
+0, & z\le 0
+\end{cases}
+\]
+
+### 3.5 输出层选择
+
+| 任务 | 输出层 | 损失函数 |
+| --- | --- | --- |
+| 回归 | Linear | MSE / MAE |
+| 二分类 | Sigmoid | Binary Cross Entropy |
+| 多分类单标签 | Softmax | Cross Entropy |
+| 多标签分类 | Sigmoid per label | Binary Cross Entropy |
+
+## 四、反向传播与自动微分
+
+### 4.1 梯度下降
+
+参数更新：
+
+\[
+\theta := \theta - \alpha \nabla_\theta J(\theta)
+\]
+
+对单个参数：
+
+\[
+\theta_j := \theta_j - \alpha\frac{\partial J}{\partial \theta_j}
+\]
+
+### 4.2 链式法则
+
+若：
+
+\[
+y=f(u),\quad u=g(x)
+\]
+
+则：
+
+\[
+\frac{dy}{dx}=\frac{dy}{du}\frac{du}{dx}
+\]
+
+深层网络就是大量函数复合，反向传播本质上是高效应用链式法则。
+
+### 4.3 单层反向传播公式
+
+对第 \(l\) 层：
+
+\[
+Z^{[l]}=W^{[l]}A^{[l-1]}+b^{[l]}
+\]
+
+\[
+A^{[l]}=g(Z^{[l]})
+\]
+
+已知 \(dZ^{[l]}\)，则：
+
+\[
+dW^{[l]}=\frac{1}{m}dZ^{[l]}(A^{[l-1]})^T
+\]
+
+\[
+db^{[l]}=\frac{1}{m}\sum_{i=1}^{m}dZ^{[l](i)}
+\]
+
+\[
+dA^{[l-1]}=(W^{[l]})^TdZ^{[l]}
+\]
+
+若激活函数为 \(g\)：
+
+\[
+dZ^{[l]}=dA^{[l]}\odot g'(Z^{[l]})
+\]
+
+### 4.4 Softmax + 交叉熵梯度
+
+Softmax：
+
+\[
+\hat{y}_k=\frac{e^{z_k}}{\sum_j e^{z_j}}
+\]
+
+交叉熵：
+
+\[
+L=-\sum_k y_k\log\hat{y}_k
+\]
+
+二者组合后有简洁梯度：
+
+\[
+\frac{\partial L}{\partial z_k}=\hat{y}_k-y_k
+\]
+
+这是深度学习分类任务中非常重要的结论。
+
+### 4.5 计算图直觉
+
+```text
+X, W, b -> Z -> A -> Loss
+              ^     |
+              |     v
+          gradients back
+```
+
+自动微分框架会记录前向计算图，在 `loss.backward()` 时沿图反向计算梯度。
+
+### 4.6 NumPy 实验：两层神经网络
+
+??? example "Code"
+    ```python
+    import numpy as np
+
+    def relu(z):
+        return np.maximum(0, z)
+
+    def relu_backward(dA, Z):
+        dZ = dA.copy()
+        dZ[Z <= 0] = 0
+        return dZ
+
+    def softmax(z):
+        z = z - np.max(z, axis=1, keepdims=True)
+        exp_z = np.exp(z)
+        return exp_z / np.sum(exp_z, axis=1, keepdims=True)
+
+    def one_hot(y, num_classes):
+        out = np.zeros((len(y), num_classes))
+        out[np.arange(len(y)), y] = 1
+        return out
+
+    def train_two_layer_mlp(X, y, hidden_size=16, lr=0.1, epochs=1000):
+        n, d = X.shape
+        num_classes = int(y.max()) + 1
+        Y = one_hot(y, num_classes)
+
+        rng = np.random.default_rng(42)
+        W1 = rng.normal(0, np.sqrt(2 / d), size=(d, hidden_size))
+        b1 = np.zeros(hidden_size)
+        W2 = rng.normal(0, np.sqrt(2 / hidden_size), size=(hidden_size, num_classes))
+        b2 = np.zeros(num_classes)
+
+        for epoch in range(epochs):
+            Z1 = X @ W1 + b1
+            A1 = relu(Z1)
+            Z2 = A1 @ W2 + b2
+            P = softmax(Z2)
+
+            loss = -np.mean(np.sum(Y * np.log(P + 1e-12), axis=1))
+
+            dZ2 = (P - Y) / n
+            dW2 = A1.T @ dZ2
+            db2 = dZ2.sum(axis=0)
+            dA1 = dZ2 @ W2.T
+            dZ1 = relu_backward(dA1, Z1)
+            dW1 = X.T @ dZ1
+            db1 = dZ1.sum(axis=0)
+
+            W1 -= lr * dW1
+            b1 -= lr * db1
+            W2 -= lr * dW2
+            b2 -= lr * db2
+
+            if epoch % 200 == 0:
+                pred = P.argmax(axis=1)
+                acc = (pred == y).mean()
+                print(f"epoch={epoch}, loss={loss:.4f}, acc={acc:.3f}")
+
+        return (W1, b1, W2, b2)
+    ```
+
+## 五、初始化、归一化与优化器
+
+### 5.1 为什么初始化重要
+
+若权重过小：
+
+- 激活值接近 0。
+- 梯度可能逐层变小。
+
+若权重过大：
+
+- 激活值或梯度可能爆炸。
+- Sigmoid/Tanh 进入饱和区。
+
+### 5.2 Xavier 与 He 初始化
+
+Xavier 初始化适合 Tanh/Sigmoid：
+
+\[
+Var(W)=\frac{2}{n_{in}+n_{out}}
+\]
+
+He 初始化适合 ReLU：
+
+\[
+Var(W)=\frac{2}{n_{in}}
+\]
+
+PyTorch 中：
+
 ```python
-def train_model(model, train_loader, criterion, optimizer, num_epochs=10, device='cuda'):
-    model.to(device)
-    model.train()
-    
-    for epoch in range(num_epochs):
-        running_loss = 0.0
-        correct = 0
-        total = 0
-        
-        for inputs, labels in train_loader:
-            inputs, labels = inputs.to(device), labels.to(device)
-            
-            # 前向传播
-            outputs = model(inputs)
-            loss = criterion(outputs, labels)
-            
-            # 反向传播与优化
+import torch.nn as nn
+
+layer = nn.Linear(128, 64)
+nn.init.kaiming_normal_(layer.weight, nonlinearity="relu")
+nn.init.zeros_(layer.bias)
+```
+
+### 5.3 梯度消失与梯度爆炸
+
+| 问题 | 表现 | 常见处理 |
+| --- | --- | --- |
+| 梯度消失 | 前层几乎学不动 | ReLU、残差连接、归一化、合适初始化 |
+| 梯度爆炸 | loss 变 NaN、参数剧烈震荡 | 梯度裁剪、减小学习率、归一化 |
+
+梯度裁剪：
+
+```python
+torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+```
+
+### 5.4 Batch Normalization
+
+对 mini-batch 中某层输入做标准化：
+
+\[
+\mu_B=\frac{1}{m}\sum_{i=1}^{m}x_i
+\]
+
+\[
+\sigma_B^2=\frac{1}{m}\sum_{i=1}^{m}(x_i-\mu_B)^2
+\]
+
+\[
+\hat{x}_i=\frac{x_i-\mu_B}{\sqrt{\sigma_B^2+\epsilon}}
+\]
+
+\[
+y_i=\gamma\hat{x}_i+\beta
+\]
+
+作用：
+
+- 稳定激活分布。
+- 允许较大学习率。
+- 有轻微正则化效果。
+
+### 5.5 Layer Normalization
+
+LayerNorm 在单个样本的特征维度上归一化，常用于 RNN 和 Transformer。
+
+| 归一化 | 归一化维度 | 常见场景 |
+| --- | --- | --- |
+| BatchNorm | batch 维度 | CNN |
+| LayerNorm | feature 维度 | Transformer |
+
+### 5.6 优化器
+
+#### SGD
+
+\[
+\theta := \theta - \alpha g_t
+\]
+
+#### Momentum
+
+\[
+v_t=\beta v_{t-1}+(1-\beta)g_t
+\]
+
+\[
+\theta := \theta-\alpha v_t
+\]
+
+#### RMSProp
+
+\[
+s_t=\beta s_{t-1}+(1-\beta)g_t^2
+\]
+
+\[
+\theta := \theta-\alpha\frac{g_t}{\sqrt{s_t}+\epsilon}
+\]
+
+#### Adam
+
+\[
+v_t=\beta_1v_{t-1}+(1-\beta_1)g_t
+\]
+
+\[
+s_t=\beta_2s_{t-1}+(1-\beta_2)g_t^2
+\]
+
+偏差修正：
+
+\[
+\hat{v}_t=\frac{v_t}{1-\beta_1^t}
+\]
+
+\[
+\hat{s}_t=\frac{s_t}{1-\beta_2^t}
+\]
+
+更新：
+
+\[
+\theta := \theta-\alpha\frac{\hat{v}_t}{\sqrt{\hat{s}_t}+\epsilon}
+\]
+
+### 5.7 学习率调度
+
+| 方法 | 思路 |
+| --- | --- |
+| Step Decay | 每隔若干 epoch 降低学习率 |
+| Exponential Decay | 指数衰减 |
+| Cosine Annealing | 余弦下降 |
+| Warmup | 前期逐渐增大学习率 |
+| ReduceLROnPlateau | 验证集不提升时降低学习率 |
+
+```python
+scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+    optimizer,
+    T_max=20
+)
+```
+
+## 六、正则化与泛化
+
+### 6.1 L2 正则化与权重衰减
+
+L2 正则：
+
+\[
+J_{reg}=J+\frac{\lambda}{2m}\sum_l\|W^{[l]}\|_F^2
+\]
+
+PyTorch 中常用 `weight_decay`：
+
+```python
+optimizer = torch.optim.Adam(
+    model.parameters(),
+    lr=1e-3,
+    weight_decay=1e-4
+)
+```
+
+### 6.2 Dropout
+
+训练时随机丢弃部分神经元：
+
+\[
+\tilde{a}^{[l]} = d^{[l]}\odot a^{[l]}
+\]
+
+其中 \(d^{[l]}\) 是 Bernoulli mask。
+
+反向直觉：
+
+- 每次训练不同子网络。
+- 减少神经元间复杂共适应。
+- 推理时使用完整网络。
+
+PyTorch：
+
+```python
+nn.Dropout(p=0.5)
+```
+
+### 6.3 数据增强
+
+图像常用：
+
+- 随机裁剪。
+- 水平翻转。
+- 颜色扰动。
+- Cutout、Mixup、CutMix。
+
+文本常用：
+
+- 同义词替换。
+- 随机删除。
+- 回译。
+- Mask token。
+
+### 6.4 Early Stopping
+
+当验证集指标长期不提升时停止训练。
+
+```text
+best_val_loss = inf
+patience = 5
+if val_loss improves:
+    save checkpoint
+else:
+    wait += 1
+if wait >= patience:
+    stop training
+```
+
+### 6.5 数据泄漏
+
+常见错误：
+
+- 在全数据上 fit 标准化器。
+- 测试集参与调参。
+- 数据增强或采样没有按训练/测试隔离。
+- 同一用户或同一病例数据同时出现在训练和测试中。
+
+正确原则：所有从数据中“学习”的预处理步骤都只能在训练集上 fit。
+
+## 七、卷积神经网络 CNN
+
+### 7.1 为什么 CNN 适合图像
+
+CNN 利用图像的三个性质：
+
+| 性质 | 含义 |
+| --- | --- |
+| 局部连接 | 局部像素强相关 |
+| 权重共享 | 同一个特征可在不同位置出现 |
+| 平移等变 | 输入平移后特征图相应平移 |
+
+### 7.2 卷积输出尺寸
+
+若输入尺寸为 \(H\times W\)，卷积核大小 \(F\)，填充 \(P\)，步幅 \(S\)，则输出：
+
+\[
+H_{out}=\left\lfloor\frac{H+2P-F}{S}\right\rfloor+1
+\]
+
+\[
+W_{out}=\left\lfloor\frac{W+2P-F}{S}\right\rfloor+1
+\]
+
+参数量：
+
+\[
+Params = F_h \times F_w \times C_{in} \times C_{out} + C_{out}
+\]
+
+### 7.3 卷积层直觉
+
+```text
+Input image
+  -> Conv 3x3: edge / texture
+  -> Conv 3x3: local parts
+  -> Conv 3x3: object patterns
+  -> Classifier
+```
+
+### 7.4 池化
+
+最大池化：
+
+\[
+y=\max_{i,j\in window}x_{ij}
+\]
+
+平均池化：
+
+\[
+y=\frac{1}{|window|}\sum_{i,j\in window}x_{ij}
+\]
+
+作用：
+
+- 降低空间尺寸。
+- 减少计算量。
+- 增强局部平移鲁棒性。
+
+### 7.5 经典 CNN
+
+| 模型 | 核心思想 |
+| --- | --- |
+| LeNet | 早期 CNN，用于手写数字 |
+| AlexNet | ReLU、Dropout、GPU 训练 |
+| VGG | 多个小卷积核堆叠 |
+| GoogLeNet | Inception 多尺度分支 |
+| ResNet | 残差连接，训练很深网络 |
+
+### 7.6 残差连接
+
+普通映射：
+
+\[
+H(x)
+\]
+
+残差学习：
+
+\[
+H(x)=F(x)+x
+\]
+
+```text
+x -----> + -----> output
+ \       ^
+  \      |
+   -> F(x)
+```
+
+残差连接让梯度更容易传回前层，缓解深层网络退化问题。
+
+### 7.7 PyTorch 实验：CNN 图像分类
+
+??? example "Code"
+    ```python
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    from torch.utils.data import DataLoader
+    from torchvision import datasets, transforms
+
+    class SimpleCNN(nn.Module):
+        def __init__(self, num_classes=10):
+            super().__init__()
+            self.features = nn.Sequential(
+                nn.Conv2d(1, 32, kernel_size=3, padding=1),
+                nn.BatchNorm2d(32),
+                nn.ReLU(),
+                nn.MaxPool2d(2),
+                nn.Conv2d(32, 64, kernel_size=3, padding=1),
+                nn.BatchNorm2d(64),
+                nn.ReLU(),
+                nn.MaxPool2d(2)
+            )
+            self.classifier = nn.Sequential(
+                nn.Flatten(),
+                nn.Linear(64 * 7 * 7, 128),
+                nn.ReLU(),
+                nn.Dropout(0.5),
+                nn.Linear(128, num_classes)
+            )
+
+        def forward(self, x):
+            x = self.features(x)
+            return self.classifier(x)
+
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize((0.1307,), (0.3081,))
+    ])
+
+    train_dataset = datasets.MNIST(
+        root="./data",
+        train=True,
+        download=True,
+        transform=transform
+    )
+    test_dataset = datasets.MNIST(
+        root="./data",
+        train=False,
+        download=True,
+        transform=transform
+    )
+
+    train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+    test_loader = DataLoader(test_dataset, batch_size=256)
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    model = SimpleCNN().to(device)
+    criterion = nn.CrossEntropyLoss()
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+
+    for epoch in range(3):
+        model.train()
+        for X, y in train_loader:
+            X, y = X.to(device), y.to(device)
+            logits = model(X)
+            loss = criterion(logits, y)
+
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            
-            # 统计损失与准确率
-            running_loss += loss.item() * inputs.size(0)
-            _, predicted = torch.max(outputs.data, 1)
-            total += labels.size(0)
-            correct += (predicted == labels).sum().item()
-        
-        epoch_loss = running_loss / total
-        epoch_acc = correct / total * 100
-        print(f"Epoch {epoch+1}/{num_epochs}, Loss: {epoch_loss:.4f}, Accuracy: {epoch_acc:.2f}%")
+
+        model.eval()
+        correct = 0
+        total = 0
+        with torch.no_grad():
+            for X, y in test_loader:
+                X, y = X.to(device), y.to(device)
+                pred = model(X).argmax(dim=1)
+                correct += (pred == y).sum().item()
+                total += y.numel()
+
+        print(f"epoch={epoch + 1}, test_acc={correct / total:.4f}")
+    ```
+
+## 八、循环神经网络 RNN、LSTM 与 GRU
+
+### 8.1 序列建模
+
+序列任务输入具有时间或顺序结构：
+
+```text
+x1 -> x2 -> x3 -> ... -> xT
 ```
+
+例：
+
+- 文本分类。
+- 语言模型。
+- 机器翻译。
+- 时间序列预测。
+
+### 8.2 基础 RNN
+
+隐藏状态更新：
+
+\[
+h_t=\tanh(W_{xh}x_t+W_{hh}h_{t-1}+b_h)
+\]
+
+输出：
+
+\[
+o_t=W_{hy}h_t+b_y
+\]
+
+问题：
+
+- 长序列中梯度容易消失或爆炸。
+- 很难捕捉长期依赖。
+
+### 8.3 LSTM
+
+LSTM 用门控机制控制信息流。
+
+遗忘门：
+
+\[
+f_t=\sigma(W_f[h_{t-1},x_t]+b_f)
+\]
+
+输入门：
+
+\[
+i_t=\sigma(W_i[h_{t-1},x_t]+b_i)
+\]
+
+候选记忆：
+
+\[
+\tilde{c}_t=\tanh(W_c[h_{t-1},x_t]+b_c)
+\]
+
+细胞状态：
+
+\[
+c_t=f_t\odot c_{t-1}+i_t\odot \tilde{c}_t
+\]
+
+输出门：
+
+\[
+o_t=\sigma(W_o[h_{t-1},x_t]+b_o)
+\]
+
+隐藏状态：
+
+\[
+h_t=o_t\odot\tanh(c_t)
+\]
+
+### 8.4 GRU
+
+GRU 更简洁：
+
+更新门：
+
+\[
+z_t=\sigma(W_z[h_{t-1},x_t])
+\]
+
+重置门：
+
+\[
+r_t=\sigma(W_r[h_{t-1},x_t])
+\]
+
+候选状态：
+
+\[
+\tilde{h}_t=\tanh(W_h[r_t\odot h_{t-1},x_t])
+\]
+
+最终状态：
+
+\[
+h_t=(1-z_t)\odot h_{t-1}+z_t\odot \tilde{h}_t
+\]
+
+### 8.5 Embedding
+
+词嵌入把离散 token 映射为连续向量。
+
+```text
+token id -> embedding table lookup -> dense vector
+```
+
+若词表大小为 \(V\)，嵌入维度为 \(d\)，Embedding 参数量：
+
+\[
+V \times d
+\]
+
+### 8.6 PyTorch 实验：LSTM 文本分类骨架
+
+??? example "Code"
+    ```python
+    import torch
+    import torch.nn as nn
+
+    class LSTMTextClassifier(nn.Module):
+        def __init__(self, vocab_size, embed_dim, hidden_dim, num_classes, padding_idx=0):
+            super().__init__()
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=padding_idx)
+            self.lstm = nn.LSTM(
+                input_size=embed_dim,
+                hidden_size=hidden_dim,
+                num_layers=1,
+                batch_first=True,
+                bidirectional=True
+            )
+            self.fc = nn.Linear(hidden_dim * 2, num_classes)
+
+        def forward(self, input_ids):
+            x = self.embedding(input_ids)
+            output, (h_n, c_n) = self.lstm(x)
+            h_forward = h_n[-2]
+            h_backward = h_n[-1]
+            h = torch.cat([h_forward, h_backward], dim=1)
+            return self.fc(h)
+
+    batch_size = 4
+    seq_len = 8
+    vocab_size = 1000
+    input_ids = torch.randint(1, vocab_size, (batch_size, seq_len))
+
+    model = LSTMTextClassifier(
+        vocab_size=vocab_size,
+        embed_dim=64,
+        hidden_dim=128,
+        num_classes=3
+    )
+    logits = model(input_ids)
+    print(logits.shape)  # (4, 3)
+    ```
+
+## 九、注意力机制与 Transformer
+
+### 9.1 Attention 的直觉
+
+注意力机制让模型在生成某个表示时，根据相关性动态关注输入中的不同位置。
+
+```text
+Query: 我现在要找什么
+Key:   每个位置有什么索引
+Value: 每个位置真正提供什么信息
+```
+
+### 9.2 Scaled Dot-Product Attention
+
+给定：
+
+- \(Q\in \mathbb{R}^{n_q\times d_k}\)
+- \(K\in \mathbb{R}^{n_k\times d_k}\)
+- \(V\in \mathbb{R}^{n_k\times d_v}\)
+
+注意力：
+
+\[
+Attention(Q,K,V)=softmax\left(\frac{QK^T}{\sqrt{d_k}}\right)V
+\]
+
+除以 \(\sqrt{d_k}\) 是为了避免点积过大导致 softmax 饱和。
+
+### 9.3 Multi-Head Attention
+
+多头注意力把表示分成多个子空间并行学习：
+
+\[
+head_i=Attention(QW_i^Q,KW_i^K,VW_i^V)
+\]
+
+\[
+MultiHead(Q,K,V)=Concat(head_1,\dots,head_h)W^O
+\]
+
+### 9.4 Transformer Block
+
+```text
+x
+ |-- Multi-Head Self-Attention
+ |-- Add & LayerNorm
+ |-- Feed Forward Network
+ |-- Add & LayerNorm
+ v
+output
+```
+
+前馈网络：
+
+\[
+FFN(x)=\max(0,xW_1+b_1)W_2+b_2
+\]
+
+### 9.5 位置编码
+
+Transformer 没有循环结构，需要显式注入位置信息。
+
+正弦位置编码：
+
+\[
+PE_{(pos,2i)}=\sin\left(\frac{pos}{10000^{2i/d_{model}}}\right)
+\]
+
+\[
+PE_{(pos,2i+1)}=\cos\left(\frac{pos}{10000^{2i/d_{model}}}\right)
+\]
+
+### 9.6 PyTorch 实验：Transformer Encoder 分类器
+
+??? example "Code"
+    ```python
+    import torch
+    import torch.nn as nn
+
+    class TransformerClassifier(nn.Module):
+        def __init__(self, vocab_size, embed_dim, num_heads, num_layers, num_classes, max_len=256):
+            super().__init__()
+            self.embedding = nn.Embedding(vocab_size, embed_dim, padding_idx=0)
+            self.position = nn.Embedding(max_len, embed_dim)
+
+            encoder_layer = nn.TransformerEncoderLayer(
+                d_model=embed_dim,
+                nhead=num_heads,
+                dim_feedforward=embed_dim * 4,
+                dropout=0.1,
+                batch_first=True
+            )
+            self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
+            self.fc = nn.Linear(embed_dim, num_classes)
+
+        def forward(self, input_ids):
+            batch_size, seq_len = input_ids.shape
+            pos = torch.arange(seq_len, device=input_ids.device).unsqueeze(0).expand(batch_size, seq_len)
+            x = self.embedding(input_ids) + self.position(pos)
+
+            padding_mask = input_ids.eq(0)
+            h = self.encoder(x, src_key_padding_mask=padding_mask)
+
+            cls = h[:, 0, :]
+            return self.fc(cls)
+
+    model = TransformerClassifier(
+        vocab_size=5000,
+        embed_dim=128,
+        num_heads=4,
+        num_layers=2,
+        num_classes=2
+    )
+
+    input_ids = torch.randint(1, 5000, (8, 32))
+    logits = model(input_ids)
+    print(logits.shape)  # (8, 2)
+    ```
+
+## 十、生成模型基础
+
+### 10.1 Autoencoder
+
+自编码器学习压缩表示并重构输入。
+
+```text
+x -> Encoder -> z -> Decoder -> x_hat
+```
+
+重构损失：
+
+\[
+L=\|x-\hat{x}\|^2
+\]
+
+用途：
+
+- 降维。
+- 去噪。
+- 异常检测。
+- 表示学习。
+
+### 10.2 VAE
+
+VAE 学习潜变量分布：
+
+\[
+q_\phi(z|x)
+\]
+
+并用解码器生成：
+
+\[
+p_\theta(x|z)
+\]
+
+目标函数包含重构项和 KL 散度：
+
+\[
+L = \mathbb{E}_{q_\phi(z|x)}[\log p_\theta(x|z)]
+-D_{KL}(q_\phi(z|x)\|p(z))
+\]
+
+### 10.3 GAN
+
+GAN 包含生成器 \(G\) 和判别器 \(D\)：
+
+\[
+\min_G \max_D
+\mathbb{E}_{x\sim p_{data}}[\log D(x)]
++\mathbb{E}_{z\sim p_z}[\log(1-D(G(z)))]
+\]
+
+直觉：
+
+- 判别器学习区分真样本和假样本。
+- 生成器学习骗过判别器。
+
+### 10.4 Diffusion 直觉
+
+扩散模型逐步给数据加噪，再学习反向去噪过程。
+
+```text
+x0 -> x1 -> x2 -> ... -> xT   forward noising
+xT -> ... -> x2 -> x1 -> x0   reverse denoising
+```
+
+在现代图像生成中非常重要，但公式较多，可单独深入。
+
+## 十一、训练工程与实验模板
+
+### 11.1 标准训练循环
+
+??? example "Code"
+    ```python
+    import torch
+
+    def train_one_epoch(model, loader, criterion, optimizer, device):
+        model.train()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+
+        for X, y in loader:
+            X, y = X.to(device), y.to(device)
+
+            logits = model(X)
+            loss = criterion(logits, y)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+
+            total_loss += loss.item() * X.size(0)
+            pred = logits.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += y.numel()
+
+        return total_loss / total, correct / total
+
+    @torch.no_grad()
+    def evaluate(model, loader, criterion, device):
+        model.eval()
+        total_loss = 0.0
+        correct = 0
+        total = 0
+
+        for X, y in loader:
+            X, y = X.to(device), y.to(device)
+            logits = model(X)
+            loss = criterion(logits, y)
+
+            total_loss += loss.item() * X.size(0)
+            pred = logits.argmax(dim=1)
+            correct += (pred == y).sum().item()
+            total += y.numel()
+
+        return total_loss / total, correct / total
+    ```
+
+### 11.2 完整实验主函数骨架
+
+??? example "Code"
+    ```python
+    import random
+    import numpy as np
+    import torch
+    import torch.nn as nn
+
+    def set_seed(seed=42):
+        random.seed(seed)
+        np.random.seed(seed)
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+
+    def main(train_loader, val_loader, model):
+        set_seed(42)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        model = model.to(device)
+
+        criterion = nn.CrossEntropyLoss()
+        optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=20)
+
+        best_val_acc = 0.0
+
+        for epoch in range(20):
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device)
+            val_loss, val_acc = evaluate(model, val_loader, criterion, device)
+            scheduler.step()
+
+            print(
+                f"epoch={epoch+1:02d} "
+                f"train_loss={train_loss:.4f} train_acc={train_acc:.4f} "
+                f"val_loss={val_loss:.4f} val_acc={val_acc:.4f}"
+            )
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), "best_model.pt")
+
+        print("best_val_acc:", best_val_acc)
+    ```
+
+### 11.3 训练/验证模式
+
+| 调用 | 作用 |
+| --- | --- |
+| `model.train()` | 启用 Dropout，BatchNorm 使用 batch 统计 |
+| `model.eval()` | 关闭 Dropout，BatchNorm 使用 running 统计 |
+| `torch.no_grad()` | 不记录梯度，节省显存和计算 |
+| `optimizer.zero_grad()` | 清空上一轮梯度 |
+| `loss.backward()` | 反向传播计算梯度 |
+| `optimizer.step()` | 更新参数 |
+
+### 11.4 保存和加载模型
+
+```python
+torch.save(model.state_dict(), "model.pt")
+
+model = SimpleCNN()
+model.load_state_dict(torch.load("model.pt", map_location="cpu"))
+model.eval()
+```
+
+### 11.5 混合精度训练
+
+```python
+scaler = torch.cuda.amp.GradScaler()
+
+for X, y in train_loader:
+    X, y = X.to(device), y.to(device)
+
+    optimizer.zero_grad()
+    with torch.cuda.amp.autocast():
+        logits = model(X)
+        loss = criterion(logits, y)
+
+    scaler.scale(loss).backward()
+    scaler.step(optimizer)
+    scaler.update()
+```
+
+混合精度可减少显存、加速训练，但要注意数值稳定。
+
+## 十二、调试与性能诊断
+
+### 12.1 训练前检查
+
+| 检查项 | 说明 |
+| --- | --- |
+| 输入 shape | 是否符合模型期望 |
+| 标签 shape | 分类任务通常为 `(batch,)` |
+| 标签范围 | `CrossEntropyLoss` 要求类别为 `0..C-1` |
+| 数据归一化 | 图像是否按训练设置 normalize |
+| loss 初值 | 是否接近合理范围 |
+| 小数据过拟合 | 模型能否在几十个样本上训练到接近 100% |
+
+### 12.2 常见训练现象
+
+| 现象 | 可能原因 | 处理 |
+| --- | --- | --- |
+| loss 不下降 | 学习率不合适、模型太弱、标签错 | 调学习率、检查数据、先过拟合小样本 |
+| loss NaN | 学习率过大、除零、log(0)、梯度爆炸 | 降学习率、加 eps、梯度裁剪 |
+| 训练好验证差 | 过拟合 | 数据增强、正则化、Dropout、早停 |
+| 训练和验证都差 | 欠拟合 | 增大模型、训练更久、换特征/架构 |
+| GPU 利用率低 | 数据加载慢 | 增加 `num_workers`、预处理缓存 |
+
+### 12.3 梯度检查
+
+如果手写反向传播，可用数值梯度检查：
+
+\[
+\frac{\partial J}{\partial \theta}
+\approx
+\frac{J(\theta+\epsilon)-J(\theta-\epsilon)}{2\epsilon}
+\]
+
+若数值梯度和反向传播梯度差异很大，说明实现有 bug。
+
+### 12.4 误差分析
+
+训练完成后不要只看一个 accuracy，应查看：
+
+- 哪些类别最容易错。
+- 错误样本是否标注有问题。
+- 数据是否分布偏移。
+- 类别是否不平衡。
+- 模型是否对某些背景、风格或长度敏感。
+
+## 十三、迁移学习与预训练模型
+
+### 13.1 迁移学习
+
+迁移学习利用在大数据上预训练的模型，迁移到小数据任务。
+
+常见策略：
+
+| 策略 | 做法 |
+| --- | --- |
+| Feature Extractor | 冻结 backbone，只训练分类头 |
+| Fine-tuning | 解冻部分或全部层，用小学习率微调 |
+| Linear Probing | 冻结预训练模型，训练线性分类器 |
+
+### 13.2 PyTorch 实验：微调 ResNet
+
+```python
+import torch.nn as nn
+from torchvision import models
+
+def build_finetune_resnet(num_classes):
+    model = models.resnet18(weights=models.ResNet18_Weights.DEFAULT)
+
+    for param in model.parameters():
+        param.requires_grad = False
+
+    in_features = model.fc.in_features
+    model.fc = nn.Linear(in_features, num_classes)
+    return model
+
+model = build_finetune_resnet(num_classes=5)
+```
+
+若数据量较大，可解冻最后几层：
+
+```python
+for name, param in model.named_parameters():
+    if name.startswith("layer4") or name.startswith("fc"):
+        param.requires_grad = True
+```
+
+### 13.3 预训练语言模型
+
+Transformer 预训练模型常见使用方式：
+
+- 使用 tokenizer 把文本转成 token id。
+- 加载预训练模型。
+- 在下游任务上 fine-tune。
+- 用验证集控制过拟合。
+
+## 十四、高频易错点
+
+| 知识点 | 易错说法 | 正确理解 |
+| --- | --- | --- |
+| 深度学习 | 层越深一定越好 | 深层网络更难训练，需要残差、归一化和足够数据 |
+| Sigmoid | 所有隐藏层都适合用 | 深层网络中容易梯度消失，隐藏层常用 ReLU/GELU |
+| Softmax | 先手动 softmax 再喂 `CrossEntropyLoss` | PyTorch 的 `CrossEntropyLoss` 接收 logits |
+| `model.eval()` | 只是提高速度 | 它会改变 Dropout 和 BatchNorm 行为 |
+| 梯度 | 每轮会自动清零 | PyTorch 默认累积梯度，需要 `zero_grad()` |
+| Dropout | 推理时也随机丢弃 | eval 模式下 Dropout 关闭 |
+| BatchNorm | 小 batch 总是稳定 | batch 太小统计不稳，可考虑 LayerNorm/GroupNorm |
+| 过拟合 | 只靠加深模型解决 | 应使用数据增强、正则化、早停、更多数据 |
+| CNN | 卷积一定降低尺寸 | 输出尺寸取决于 padding、stride、kernel |
+| RNN | 天然能记住很长上下文 | 基础 RNN 长期依赖困难，LSTM/GRU 改进 |
+| Attention | 完全不需要位置信息 | 自注意力本身不含顺序，需位置编码 |
+| 迁移学习 | 预训练模型无需验证 | 仍需验证集和合适学习率 |
+
+## 十五、公式速查
+
+| 内容 | 公式 |
+| --- | --- |
+| 线性层 | \(Z=XW+b\) |
+| 神经元 | \(a=g(w^Tx+b)\) |
+| Sigmoid | \(\sigma(z)=\frac{1}{1+e^{-z}}\) |
+| ReLU | \(ReLU(z)=\max(0,z)\) |
+| Softmax | \(softmax(z)_i=\frac{e^{z_i}}{\sum_j e^{z_j}}\) |
+| 二分类交叉熵 | \(-[y\log\hat{y}+(1-y)\log(1-\hat{y})]\) |
+| 多分类交叉熵 | \(-\sum_k y_k\log\hat{y}_k\) |
+| 前向传播 | \(Z^{[l]}=W^{[l]}A^{[l-1]}+b^{[l]}\) |
+| 激活 | \(A^{[l]}=g^{[l]}(Z^{[l]})\) |
+| 权重梯度 | \(dW^{[l]}=\frac{1}{m}dZ^{[l]}(A^{[l-1]})^T\) |
+| 偏置梯度 | \(db^{[l]}=\frac{1}{m}\sum_i dZ^{[l](i)}\) |
+| 梯度下降 | \(\theta:=\theta-\alpha\nabla_\theta J\) |
+| L2 正则 | \(J_{reg}=J+\frac{\lambda}{2m}\sum_l\|W^{[l]}\|_F^2\) |
+| 卷积输出高 | \(H_{out}=\lfloor\frac{H+2P-F}{S}\rfloor+1\) |
+| 卷积参数量 | \(F_hF_wC_{in}C_{out}+C_{out}\) |
+| RNN | \(h_t=\tanh(W_{xh}x_t+W_{hh}h_{t-1}+b_h)\) |
+| Attention | \(softmax(\frac{QK^T}{\sqrt{d_k}})V\) |
+| Adam 更新 | \(\theta:=\theta-\alpha\frac{\hat{v}_t}{\sqrt{\hat{s}_t}+\epsilon}\) |
+
+## 十六、复习路线
+
+### 第一轮：基础网络
+
+1. 张量 shape、线性层、激活函数。
+2. 逻辑回归、MLP、交叉熵。
+3. 前向传播和反向传播公式。
+4. 梯度下降、SGD、Momentum、Adam。
+
+### 第二轮：训练稳定性
+
+1. Xavier/He 初始化。
+2. 梯度消失和梯度爆炸。
+3. BatchNorm、LayerNorm。
+4. Dropout、L2、数据增强、早停。
+
+### 第三轮：核心架构
+
+1. CNN：卷积、池化、输出尺寸、ResNet。
+2. RNN/LSTM/GRU：序列建模和门控机制。
+3. Attention/Transformer：QKV、多头注意力、位置编码。
+4. 生成模型：Autoencoder、VAE、GAN、Diffusion 直觉。
+
+### 第四轮：实验能力
+
+1. 会写标准 PyTorch 训练循环。
+2. 会保存最佳模型和复现实验。
+3. 会检查 shape、loss、梯度、学习率。
+4. 会在小数据上过拟合模型验证代码正确性。
+5. 会做错误分析和调参记录。
+
+## 十七、参考资料
+
+- 斋藤康毅：《深度学习入门：基于 Python 的理论与实现》。
+- Ian Goodfellow, Yoshua Bengio, Aaron Courville：《深度学习》。
+- Andrew Ng：《Deep Learning Specialization》视频课程，用于参考神经网络、优化、正则化、CNN、序列模型等主线。
+- 李沐等：《动手学深度学习》视频与教材，用于参考 PyTorch 实践、训练技巧、CNN、RNN、Attention 与 Transformer。
