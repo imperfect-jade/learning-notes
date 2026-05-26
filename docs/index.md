@@ -28,3 +28,5 @@
 ## 人工智能
 
 - [人工智能](ai/index.md)
+- [机器学习](ai/machine-learning.md)
+- [深度学习](ai/deep-learning.md)
