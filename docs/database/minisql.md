@@ -60,10 +60,13 @@
 | 已讲解 | 3.2 B+ 树页结构 | 见“实验三” |
 | 已讲解 | 3.3 B+ 树插入、查找、删除 | 见“实验三” |
 | 已讲解 | 3.4 IndexIterator 与 BPlusTreeIndex | 见“实验三” |
+| 已讲解 | 4.1 Catalog Manager 概览 | 见“实验四” |
+| 已讲解 | 4.2 Catalog / Table / Index 元信息持久化 | 见“实验四” |
+| 已讲解 | 4.3 表和索引的创建、加载、删除 | 见“实验四” |
 
 ## 下一步
 
-建议先按本教程完成 `BitmapPage`，运行 `disk_manager_test` 中的 `BitMapPageTest`；通过后再继续实现 `DiskManager`、`LRUReplacer` 和 `BufferPoolManager`。
+建议按实验顺序推进。当前讲解已经覆盖实验一到实验四，下一节将进入 `Planner and Executor`，也就是把 SQL 语法树转成执行动作并调用前面实现的表、索引和目录模块。
 
 ## 实验一：Disk and Buffer Pool Manager
 
@@ -2899,3 +2902,1045 @@ buffer_pool_manager_->CheckAllUnpinned()
 问题：BPlusTreeIndex 和 BPlusTree 的关系是什么？
 
 回答要点：`BPlusTree` 只处理 `GenericKey -> RowId` 的树结构；`BPlusTreeIndex` 是上层索引接口，负责把 `Row key` 序列化成 `GenericKey`，并支持不同比较操作的扫描。
+
+## 实验四：Catalog Manager
+
+### 1. 实验目标
+
+实验四要实现 MiniSQL 的目录管理器，也就是 `Catalog Manager`。如果说前三个实验分别解决了“页怎么管理”“记录怎么存”“索引怎么查”，那么实验四解决的是：
+
+```text
+数据库怎么记住有哪些表、有哪些索引、它们叫什么、结构是什么、数据入口页在哪里。
+```
+
+用户执行：
+
+```sql
+create table account (...);
+create index idx_account_id on account(id);
+```
+
+数据库不能只在内存里创建对象。否则进程退出后，再打开数据库文件，表和索引就全丢了。Catalog 的任务就是把这些元信息持久化到数据库文件中，并在重启时重新加载出来。
+
+本实验要完成三类内容：
+
+1. 元信息对象的序列化：
+   - `CatalogMeta`
+   - `TableMetadata`
+   - `IndexMetadata`
+2. 内存对象的构建：
+   - `TableInfo`
+   - `IndexInfo`
+3. 目录管理接口：
+   - `CreateTable`
+   - `GetTable`
+   - `GetTables`
+   - `DropTable`
+   - `CreateIndex`
+   - `GetIndex`
+   - `GetTableIndexes`
+   - `DropIndex`
+   - `LoadTable`
+   - `LoadIndex`
+   - `FlushCatalogMetaPage`
+
+对应文件：
+
+- `src/include/catalog/catalog.h`
+- `src/catalog/catalog.cpp`
+- `src/include/catalog/table.h`
+- `src/catalog/table.cpp`
+- `src/include/catalog/indexes.h`
+- `src/catalog/indexes.cpp`
+- `test/catalog/catalog_test.cpp`
+
+强依赖前置实验：
+
+- 实验一：`BufferPoolManager`、`DiskManager`
+- 实验二：`Schema`、`Column`、`TableHeap`
+- 实验三：`BPlusTreeIndex`、`IndexRootsPage`
+
+### 2. 相关数据库知识
+
+#### 2.1 什么是 Catalog
+
+数据库除了保存用户数据，还必须保存“描述数据的数据”，也就是元数据。
+
+例如一张表：
+
+```sql
+create table account (
+  id int,
+  name char(64),
+  balance float
+);
+```
+
+真正的用户数据是：
+
+```text
+1, "alice", 100.0
+2, "bob", 88.5
+```
+
+但数据库还要知道：
+
+```text
+表名: account
+列数: 3
+列名: id, name, balance
+列类型: int, char(64), float
+第一张表页: page_id = ?
+有哪些索引: idx_account_id, ...
+```
+
+这些就是 Catalog 管理的内容。
+
+真实数据库中通常有系统表，例如 PostgreSQL 的 `pg_class`、`pg_attribute`，MySQL 的 data dictionary。本项目把这些信息简化成几个 C++ 元信息对象，并序列化到固定页面中。
+
+#### 2.2 Catalog 为什么要持久化
+
+如果 Catalog 不持久化，数据库重启后会出现这种情况：
+
+```text
+表数据页还在磁盘文件里
+索引页也还在磁盘文件里
+但数据库不知道这些页属于哪张表、哪棵索引
+```
+
+这等于数据还在，但入口丢了。
+
+因此实验四最重要的目标是：
+
+```text
+create table/index -> 写入 catalog
+关闭数据库
+重新打开数据库
+CatalogManager 能恢复 TableInfo / IndexInfo
+```
+
+测试 `CatalogTableTest` 和 `CatalogIndexTest` 都会验证这个重启加载能力。
+
+#### 2.3 CatalogMeta、TableMetadata、IndexMetadata 的关系
+
+三者的层级关系如下：
+
+```text
+CatalogMeta
+  table_id -> table_metadata_page_id
+  index_id -> index_metadata_page_id
+
+TableMetadata
+  table_id
+  table_name
+  first_table_page_id
+  table_schema
+
+IndexMetadata
+  index_id
+  index_name
+  table_id
+  key_map
+```
+
+可以把 `CatalogMeta` 理解成总目录，把 `TableMetadata` 和 `IndexMetadata` 理解成每个表/索引自己的档案页。
+
+为什么不把所有表和索引信息都塞进 `CatalogMeta`？
+
+因为表结构、索引列映射可能变长。把每个表和索引的详细信息放到单独页面，会让总目录更简单：
+
+```text
+CatalogMeta 只负责记录：某个 table_id 的详细信息在哪个 page。
+```
+
+#### 2.4 TableInfo 和 TableMetadata 的区别
+
+`TableMetadata` 是可以序列化落盘的纯元信息：
+
+```text
+table_id
+table_name
+root_page_id
+schema
+```
+
+`TableInfo` 是运行时对象：
+
+```text
+TableMetadata *
+TableHeap *
+```
+
+也就是说：
+
+- `TableMetadata` 负责“表是谁”。
+- `TableHeap` 负责“表的数据怎么操作”。
+- `TableInfo` 把两者绑在一起，供上层执行器使用。
+
+#### 2.5 IndexInfo 和 IndexMetadata 的区别
+
+同理：
+
+`IndexMetadata` 保存：
+
+```text
+index_id
+index_name
+table_id
+key_map
+```
+
+`IndexInfo` 保存：
+
+```text
+IndexMetadata *
+Index *
+IndexSchema *
+```
+
+其中 `Index *` 在本项目中通常是 `BPlusTreeIndex`。
+
+`key_map` 很重要。它表示索引列在原表中的位置。
+
+例如：
+
+```text
+表 schema: id(0), name(1), account(2)
+索引: (id, name)
+key_map = [0, 1]
+```
+
+如果索引是：
+
+```text
+索引: (account, id)
+key_map = [2, 0]
+```
+
+后面执行器插入记录时，会通过 `Row::GetKeyFromRow(table_schema, index_schema, key_row)` 从整行记录中提取索引 key。
+
+#### 2.6 Catalog 中为什么要有 id
+
+表名和索引名是给用户看的，`table_id` 和 `index_id` 是系统内部稳定使用的标识。
+
+好处：
+
+1. 名字可以用于查找，id 可以用于持久化引用。
+2. `IndexMetadata` 只需要保存 `table_id`，不需要重复保存完整表结构。
+3. `CatalogMeta` 用有序 `map<table_id_t, page_id_t>` 管理元信息页，方便计算下一个 id。
+
+### 3. 关键数据结构
+
+#### 3.1 CatalogMeta
+
+定义位置：
+
+- `src/include/catalog/catalog.h`
+
+字段：
+
+```cpp
+std::map<table_id_t, page_id_t> table_meta_pages_;
+std::map<index_id_t, page_id_t> index_meta_pages_;
+```
+
+序列化格式已经在 `SerializeTo` 中给出：
+
+```text
+[magic: uint32_t]
+[table_count: uint32_t]
+[index_count: uint32_t]
+[table_id, table_meta_page_id] * table_count
+[index_id, index_meta_page_id] * index_count
+```
+
+因此 `GetSerializedSize()` 应该是：
+
+```text
+12 + 8 * table_count + 8 * index_count
+```
+
+也就是：
+
+```cpp
+3 * sizeof(uint32_t)
++ table_meta_pages_.size() * (sizeof(table_id_t) + sizeof(page_id_t))
++ index_meta_pages_.size() * (sizeof(index_id_t) + sizeof(page_id_t))
+```
+
+#### 3.2 TableMetadata
+
+定义位置：
+
+- `src/include/catalog/table.h`
+- `src/catalog/table.cpp`
+
+字段：
+
+```cpp
+table_id_t table_id_;
+std::string table_name_;
+page_id_t root_page_id_;
+Schema *schema_;
+```
+
+序列化格式：
+
+```text
+[magic]
+[table_id]
+[table_name_len]
+[table_name bytes]
+[root_page_id]
+[schema]
+```
+
+`TableMetadata::GetSerializedSize()` 当前代码已经是合理的：
+
+```cpp
+4 + 4 + MACH_STR_SERIALIZED_SIZE(table_name_) + 4 + schema_->GetSerializedSize()
+```
+
+其中 `MACH_STR_SERIALIZED_SIZE(name)` 等于：
+
+```text
+4 + name.length()
+```
+
+#### 3.3 IndexMetadata
+
+定义位置：
+
+- `src/include/catalog/indexes.h`
+- `src/catalog/indexes.cpp`
+
+字段：
+
+```cpp
+index_id_t index_id_;
+std::string index_name_;
+table_id_t table_id_;
+std::vector<uint32_t> key_map_;
+```
+
+序列化格式：
+
+```text
+[magic]
+[index_id]
+[index_name_len]
+[index_name bytes]
+[table_id]
+[key_count]
+[key_map[0]]
+[key_map[1]]
+...
+```
+
+因此 `IndexMetadata::GetSerializedSize()` 应该是：
+
+```text
+4 + 4 + (4 + index_name.length()) + 4 + 4 + 4 * key_map.size()
+```
+
+也就是：
+
+```cpp
+4 + 4 + MACH_STR_SERIALIZED_SIZE(index_name_) + 4 + 4 + key_map_.size() * 4
+```
+
+### 4. CatalogManager 初始化
+
+#### 4.1 固定页面
+
+`src/include/common/config.h` 中定义：
+
+```cpp
+static constexpr int CATALOG_META_PAGE_ID = 0;
+static constexpr int INDEX_ROOTS_PAGE_ID = 1;
+```
+
+逻辑页 0：保存 `CatalogMeta`。
+
+逻辑页 1：保存 `IndexRootsPage`，也就是每棵 B+ 树索引的 root page id。
+
+`DBStorageEngine` 在初始化时会预分配这两个页面：
+
+```cpp
+bpm_->NewPage(id) -> id == CATALOG_META_PAGE_ID
+bpm_->NewPage(id) -> id == INDEX_ROOTS_PAGE_ID
+```
+
+所以 CatalogManager 构造函数必须正确处理这两种情况：
+
+```cpp
+CatalogManager(..., bool init)
+```
+
+#### 4.2 init = true
+
+表示创建一个全新数据库。
+
+应该做：
+
+1. `catalog_meta_ = CatalogMeta::NewInstance()`。
+2. `next_table_id_ = 0`。
+3. `next_index_id_ = 0`。
+4. Fetch `CATALOG_META_PAGE_ID`。
+5. 把空的 `CatalogMeta` 序列化进去。
+6. Unpin，dirty = true。
+7. Fetch `INDEX_ROOTS_PAGE_ID`。
+8. reinterpret 成 `IndexRootsPage *`。
+9. 调用 `Init()`。
+10. Unpin，dirty = true。
+
+注意：`IndexRootsPage` 属于实验三，但 Catalog 初始化新数据库时要负责把它清空。
+
+#### 4.3 init = false
+
+表示打开已有数据库。
+
+应该做：
+
+1. Fetch `CATALOG_META_PAGE_ID`。
+2. 调用 `CatalogMeta::DeserializeFrom`。
+3. Unpin，dirty = false。
+4. 根据 `catalog_meta_` 设置：
+
+```cpp
+next_table_id_ = catalog_meta_->GetNextTableId();
+next_index_id_ = catalog_meta_->GetNextIndexId();
+```
+
+5. 先加载所有表：
+
+```cpp
+for (table_id, page_id) in table_meta_pages_:
+  LoadTable(table_id, page_id)
+```
+
+6. 再加载所有索引：
+
+```cpp
+for (index_id, page_id) in index_meta_pages_:
+  LoadIndex(index_id, page_id)
+```
+
+顺序很重要：索引加载时需要根据 `table_id` 找到对应 `TableInfo`，所以必须先 load table，再 load index。
+
+### 5. 表管理接口
+
+#### 5.1 CreateTable
+
+目标：创建表，并把表元信息持久化。
+
+接口：
+
+```cpp
+dberr_t CreateTable(const std::string &table_name,
+                    TableSchema *schema,
+                    Txn *txn,
+                    TableInfo *&table_info);
+```
+
+步骤：
+
+1. 检查表名是否已存在：
+
+```cpp
+if (table_names_.count(table_name)) return DB_TABLE_ALREADY_EXIST;
+```
+
+2. 生成 table id：
+
+```cpp
+table_id_t table_id = next_table_id_++;
+```
+
+3. 深拷贝 schema：
+
+```cpp
+auto *table_schema = Schema::DeepCopySchema(schema);
+```
+
+测试中特别提醒：
+
+```cpp
+/** You should use DeepCopySchema in CreateTable. **/
+```
+
+原因：调用者传进来的 schema 可能由 `shared_ptr` 管理，Catalog 不能直接拿来拥有，否则可能重复析构或悬空。
+
+4. 创建 TableHeap：
+
+```cpp
+auto *table_heap = TableHeap::Create(buffer_pool_manager_, table_schema, txn, log_manager_, lock_manager_);
+```
+
+5. 获取表首页：
+
+```cpp
+page_id_t first_page_id = table_heap->GetFirstPageId();
+```
+
+6. 创建 TableMetadata：
+
+```cpp
+auto *table_meta = TableMetadata::Create(table_id, table_name, first_page_id, table_schema);
+```
+
+7. 为 TableMetadata 分配一个新页：
+
+```cpp
+page_id_t meta_page_id;
+auto *page = buffer_pool_manager_->NewPage(meta_page_id);
+```
+
+8. 序列化 `table_meta` 到该页。
+9. Unpin metadata page，dirty = true。
+10. 创建 TableInfo：
+
+```cpp
+table_info = TableInfo::Create();
+table_info->Init(table_meta, table_heap);
+```
+
+11. 更新内存 map：
+
+```cpp
+table_names_[table_name] = table_id;
+tables_[table_id] = table_info;
+```
+
+12. 更新 CatalogMeta：
+
+```cpp
+catalog_meta_->table_meta_pages_[table_id] = meta_page_id;
+```
+
+13. 调用 `FlushCatalogMetaPage()`。
+14. 返回 `DB_SUCCESS`。
+
+#### 5.2 GetTable
+
+按表名查：
+
+```cpp
+if table_name not found -> DB_TABLE_NOT_EXIST
+else table_info = tables_[table_id], return DB_SUCCESS
+```
+
+按 table id 查的私有版本：
+
+```cpp
+GetTable(table_id_t table_id, TableInfo *&table_info)
+```
+
+通常用于 `LoadIndex`。
+
+#### 5.3 GetTables
+
+目标：返回所有表。
+
+步骤：
+
+1. 遍历 `tables_`。
+2. 把每个 `TableInfo *` push 到输出 vector。
+3. 返回 `DB_SUCCESS`。
+
+顺序一般不重要，除非测试额外要求。
+
+#### 5.4 DropTable
+
+测试当前没有重点覆盖 DropTable，但后面 Executor 会用到。
+
+推荐行为：
+
+1. 如果表名不存在，返回 `DB_TABLE_NOT_EXIST`。
+2. 找到 table_id。
+3. 删除该表上的所有索引：
+   - 遍历 `index_names_[table_name]`。
+   - 调用 `DropIndex(table_name, index_name)`。
+4. 调用 `table_info->GetTableHeap()->DeleteTable()` 释放表数据页。
+5. 删除表元信息页：
+
+```cpp
+buffer_pool_manager_->DeletePage(catalog_meta_->table_meta_pages_[table_id]);
+```
+
+6. 从 `catalog_meta_->table_meta_pages_` 删除记录。
+7. 从 `table_names_` 和 `tables_` 删除记录。
+8. delete `TableInfo *`。
+9. Flush catalog meta page。
+10. 返回 `DB_SUCCESS`。
+
+注意：删除 map 中对象时，先保存指针，再 erase，再 delete，避免后续误用。
+
+### 6. 索引管理接口
+
+#### 6.1 IndexInfo::Init
+
+定义位置：
+
+- `src/include/catalog/indexes.h`
+
+当前 TODO：
+
+```cpp
+void Init(IndexMetadata *meta_data,
+          TableInfo *table_info,
+          BufferPoolManager *buffer_pool_manager)
+```
+
+要做三件事：
+
+1. 保存元信息：
+
+```cpp
+meta_data_ = meta_data;
+```
+
+2. 根据 `key_map` 从表 schema 创建索引 schema：
+
+```cpp
+key_schema_ = Schema::ShallowCopySchema(table_info->GetSchema(), meta_data_->GetKeyMapping());
+```
+
+这里必须用 shallow copy，因为索引 schema 的列来自表 schema，不应该深拷贝出另一套完全独立列定义。`IndexInfo` 析构时会 delete `key_schema_`，但 shallow schema 的 `is_manage_ = false`，不会 delete 里面的 Column。
+
+3. 创建索引对象：
+
+```cpp
+index_ = CreateIndex(buffer_pool_manager, "bptree");
+```
+
+这个框架目前只要求 B+ 树索引。虽然 `CatalogManager::CreateIndex` 有 `index_type` 参数，但 `IndexInfo::Init` 当前签名没有传入它。不要轻易改公共接口，按框架约定创建 `"bptree"` 即可。
+
+#### 6.2 CreateIndex
+
+接口：
+
+```cpp
+dberr_t CreateIndex(const std::string &table_name,
+                    const std::string &index_name,
+                    const std::vector<std::string> &index_keys,
+                    Txn *txn,
+                    IndexInfo *&index_info,
+                    const string &index_type);
+```
+
+步骤：
+
+1. 检查表是否存在。
+
+```cpp
+if table not found -> DB_TABLE_NOT_EXIST
+```
+
+2. 检查同一张表上索引名是否已存在。
+
+```cpp
+if index_names_[table_name].count(index_name) -> DB_INDEX_ALREADY_EXIST
+```
+
+3. 根据列名生成 key_map。
+
+```cpp
+for key_name in index_keys:
+  table_schema->GetColumnIndex(key_name, column_index)
+```
+
+如果有列不存在，返回：
+
+```cpp
+DB_COLUMN_NAME_NOT_EXIST
+```
+
+测试里会检查这个错误码：
+
+```cpp
+bad_index_keys{"id", "age", "name"}
+```
+
+4. 生成 index id：
+
+```cpp
+index_id_t index_id = next_index_id_++;
+```
+
+5. 创建 IndexMetadata：
+
+```cpp
+auto *index_meta = IndexMetadata::Create(index_id, index_name, table_id, key_map);
+```
+
+6. 为 IndexMetadata 分配新页并序列化。
+7. 创建 IndexInfo：
+
+```cpp
+index_info = IndexInfo::Create();
+index_info->Init(index_meta, table_info, buffer_pool_manager_);
+```
+
+8. 如果表里已经有记录，理论上需要扫描 `TableHeap`，把已有记录插入新索引：
+
+```text
+for row in table_heap:
+  row.GetKeyFromRow(table_schema, index_schema, key_row)
+  index->InsertEntry(key_row, row.GetRowId(), txn)
+```
+
+当前测试是在创建索引后再手动插入索引项，所以不会覆盖这个点；但真实 `CREATE INDEX` 应该为已有表数据建索引，后面的完整 SQL 功能也可能需要。
+
+9. 更新内存 map：
+
+```cpp
+index_names_[table_name][index_name] = index_id;
+indexes_[index_id] = index_info;
+```
+
+10. 更新 CatalogMeta：
+
+```cpp
+catalog_meta_->index_meta_pages_[index_id] = index_meta_page_id;
+```
+
+11. Flush catalog meta page。
+12. 返回 `DB_SUCCESS`。
+
+#### 6.3 GetIndex
+
+步骤：
+
+1. 查 `index_names_` 是否有 table_name。
+2. 查该表下是否有 index_name。
+3. 找到 index_id。
+4. `index_info = indexes_[index_id]`。
+5. 返回 `DB_SUCCESS`。
+
+如果找不到，返回：
+
+```cpp
+DB_INDEX_NOT_FOUND
+```
+
+#### 6.4 GetTableIndexes
+
+目标：返回某张表上的所有索引。
+
+步骤：
+
+1. 如果表不存在，返回 `DB_TABLE_NOT_EXIST`。
+2. 遍历 `index_names_[table_name]`。
+3. 根据 index_id 从 `indexes_` 取 `IndexInfo *`。
+4. push 到输出 vector。
+5. 返回 `DB_SUCCESS`。
+
+#### 6.5 DropIndex
+
+推荐行为：
+
+1. 如果表不存在，返回 `DB_TABLE_NOT_EXIST`。
+2. 如果索引不存在，返回 `DB_INDEX_NOT_FOUND`。
+3. 找到 index_id 和 IndexInfo。
+4. 调用：
+
+```cpp
+index_info->GetIndex()->Destroy();
+```
+
+释放 B+ 树页。
+
+5. 删除 index metadata page：
+
+```cpp
+catalog_meta_->DeleteIndexMetaPage(buffer_pool_manager_, index_id);
+```
+
+6. 从 `index_names_[table_name]` 和 `indexes_` 删除。
+7. delete `IndexInfo *`。
+8. Flush catalog meta page。
+9. 返回 `DB_SUCCESS`。
+
+注意：如果该表最后一个索引被删，可以考虑把 `index_names_[table_name]` 的空 map 也 erase。
+
+### 7. 加载流程
+
+#### 7.1 LoadTable
+
+接口：
+
+```cpp
+dberr_t LoadTable(table_id_t table_id, page_id_t page_id);
+```
+
+步骤：
+
+1. Fetch table metadata page。
+2. 调用：
+
+```cpp
+TableMetadata *table_meta = nullptr;
+TableMetadata::DeserializeFrom(page->GetData(), table_meta);
+```
+
+3. 根据 `table_meta->GetFirstPageId()` 重建 TableHeap：
+
+```cpp
+auto *table_heap = TableHeap::Create(buffer_pool_manager_,
+                                     table_meta->GetFirstPageId(),
+                                     table_meta->GetSchema(),
+                                     log_manager_,
+                                     lock_manager_);
+```
+
+4. 创建 TableInfo：
+
+```cpp
+auto *table_info = TableInfo::Create();
+table_info->Init(table_meta, table_heap);
+```
+
+5. 更新 map：
+
+```cpp
+table_names_[table_meta->GetTableName()] = table_id;
+tables_[table_id] = table_info;
+```
+
+6. Unpin metadata page，dirty = false。
+7. 返回 `DB_SUCCESS`。
+
+注意内存所有权：
+
+- `table_meta` 拥有 `schema`。
+- `table_heap` 只是使用 `schema` 指针，不负责 delete。
+- `TableInfo` 析构时 delete `table_meta` 和 `table_heap`。
+
+#### 7.2 LoadIndex
+
+接口：
+
+```cpp
+dberr_t LoadIndex(index_id_t index_id, page_id_t page_id);
+```
+
+步骤：
+
+1. Fetch index metadata page。
+2. 反序列化得到 `IndexMetadata *`。
+3. 根据 `index_meta->GetTableId()` 找到 `TableInfo *`。
+4. 创建 `IndexInfo`：
+
+```cpp
+auto *index_info = IndexInfo::Create();
+index_info->Init(index_meta, table_info, buffer_pool_manager_);
+```
+
+5. 更新 map：
+
+```cpp
+index_names_[table_info->GetTableName()][index_meta->GetIndexName()] = index_id;
+indexes_[index_id] = index_info;
+```
+
+6. Unpin metadata page，dirty = false。
+7. 返回 `DB_SUCCESS`。
+
+这个过程会构造 `BPlusTreeIndex`，而 `BPlusTreeIndex` 内部的 `BPlusTree` 构造函数应该从 `IndexRootsPage` 找到之前保存的 root page id。也就是说，索引数据页本身不是 Catalog 加载出来的；Catalog 只加载索引定义，B+ 树自己根据 index id 找 root。
+
+### 8. FlushCatalogMetaPage
+
+CatalogMeta 是总目录，任何表或索引的创建/删除都会改变它。
+
+实现步骤：
+
+1. Fetch `CATALOG_META_PAGE_ID`。
+2. 可选：清空 page data。
+3. 调用：
+
+```cpp
+catalog_meta_->SerializeTo(page->GetData());
+```
+
+4. Unpin，dirty = true。
+5. 返回 `DB_SUCCESS`。
+
+析构函数里已经调用：
+
+```cpp
+FlushCatalogMetaPage();
+```
+
+但不要只依赖析构。创建表或索引后及时 flush 更稳，尤其是测试会 delete 一个 `DBStorageEngine` 后再打开另一个。
+
+### 9. 测试怎么理解
+
+#### 9.1 CatalogMetaTest
+
+这个测试只测 `CatalogMeta` 序列化。
+
+它会：
+
+1. 创建一个空 `CatalogMeta`。
+2. 填入 17 个 table meta page 映射。
+3. 填入 25 个 index meta page 映射。
+4. 序列化到 buffer。
+5. 反序列化成另一个对象。
+6. 检查数量和值完全一致。
+
+如果这个测试失败，优先检查：
+
+```cpp
+CatalogMeta::GetSerializedSize()
+```
+
+因为 `SerializeTo` 已经写好了，但它开头会 assert：
+
+```cpp
+ASSERT(GetSerializedSize() <= PAGE_SIZE, ...)
+```
+
+#### 9.2 CatalogTableTest
+
+第一阶段：新建数据库。
+
+测试流程：
+
+1. 打开新数据库 `init = true`。
+2. `GetTable("table-1")` 应返回 `DB_TABLE_NOT_EXIST`。
+3. 创建 table-1。
+4. `GetTable("table-1")` 应成功。
+5. `table_info->GetTableHeap()` 不为空。
+6. delete db。
+
+第二阶段：重新打开已有数据库。
+
+测试流程：
+
+1. 打开 `init = false`。
+2. `GetTable("table-2")` 不存在。
+3. `GetTable("table-1")` 成功。
+
+这说明：
+
+```text
+CreateTable 必须把元信息写入磁盘
+CatalogManager(init=false) 必须能 LoadTable
+```
+
+#### 9.3 CatalogIndexTest
+
+第一阶段：新建数据库并创建表。
+
+测试会检查错误码：
+
+```text
+给不存在的 table-0 创建索引 -> DB_TABLE_NOT_EXIST
+给不存在的列 age 创建索引 -> DB_COLUMN_NAME_NOT_EXIST
+正常创建 index-1 -> DB_SUCCESS
+```
+
+然后它会手动向 `index_info->GetIndex()` 插入 10 个 key，并扫描验证。
+
+第二阶段：重新打开数据库。
+
+测试会检查：
+
+```text
+重复创建 table-1.index-1 -> DB_INDEX_ALREADY_EXIST
+GetIndex("table-1", "index-1") -> DB_SUCCESS
+之前插入索引中的 key 仍然能查到
+```
+
+这说明：
+
+1. `IndexMetadata` 必须持久化。
+2. `LoadIndex` 必须重建 `IndexInfo` 和底层 B+ 树对象。
+3. 实验三的 B+ 树 root page id 必须通过 `IndexRootsPage` 持久化。
+
+### 10. 推荐实现顺序
+
+建议按下面顺序写，不要一上来就写完整 `CatalogManager`：
+
+1. 实现 `CatalogMeta::GetSerializedSize()`。
+2. 实现 `IndexMetadata::GetSerializedSize()`。
+3. 实现 `IndexInfo::Init()`。
+4. 实现 `CatalogManager` 构造函数：
+   - 先支持 `init = true`。
+   - 再支持 `init = false`。
+5. 实现 `FlushCatalogMetaPage()`。
+6. 实现 `CreateTable()`。
+7. 实现 `GetTable()` 和私有 `GetTable(table_id)`。
+8. 实现 `LoadTable()`。
+9. 先跑 `CatalogMetaTest` 和 `CatalogTableTest`。
+10. 实现 `CreateIndex()`。
+11. 实现 `GetIndex()`、`GetTableIndexes()`。
+12. 实现 `LoadIndex()`。
+13. 再跑 `CatalogIndexTest`。
+14. 最后补 `DropTable()` 和 `DropIndex()`，为实验五 SQL 执行器做准备。
+
+测试命令：
+
+```bash
+make catalog_test -j
+./test/catalog_test
+```
+
+如果只想暂时筛选 catalog 测试，也可以修改 `test/main_test.cpp` 中的 gtest filter，但平时建议直接运行单测目标。
+
+### 11. 常见错误清单
+
+1. `CatalogMeta::GetSerializedSize()` 少算了 table/index count 头部。
+2. `IndexMetadata::GetSerializedSize()` 少算了 `key_count` 或 key_map 数组。
+3. `CreateTable` 没有用 `Schema::DeepCopySchema`，导致 schema 悬空或重复释放。
+4. `CreateTable` 创建了 `TableHeap`，但没有把 metadata page id 写进 `CatalogMeta`。
+5. 创建表后只更新了内存 map，没有 `FlushCatalogMetaPage()`。
+6. `CatalogManager(init=true)` 没初始化 `IndexRootsPage`。
+7. `CatalogManager(init=false)` 先 LoadIndex 后 LoadTable，导致找不到表。
+8. `LoadTable` 中反序列化出的 schema 被错误释放。
+9. `IndexInfo::Init` 用了 deep copy schema，导致索引列和表列关系混乱。
+10. `CreateIndex` 没检查重复索引名。
+11. `CreateIndex` 没验证列名是否存在。
+12. `CreateIndex` 只创建内存对象，没写 IndexMetadata 页。
+13. `LoadIndex` 没更新 `index_names_`，导致重启后 `GetIndex` 失败。
+14. 删除索引时只删内存 map，没有调用底层 `Index::Destroy()`。
+15. 删除表时没先删除表上的索引，留下悬空索引元信息。
+
+### 12. 验收问答准备
+
+问题：Catalog Manager 负责什么？
+
+回答要点：负责管理数据库元信息，包括有哪些表、表结构是什么、表数据首页在哪、有哪些索引、索引建在哪些列上，并把这些信息持久化，供数据库重启后恢复。
+
+问题：CatalogMeta 和 TableMetadata 有什么区别？
+
+回答要点：`CatalogMeta` 是总目录，只记录 table/index id 到其 metadata page 的映射；`TableMetadata` 是某一张表的详细信息，包括表名、表 id、表首页和 schema。
+
+问题：为什么创建表时要 DeepCopySchema？
+
+回答要点：传入的 schema 可能由调用者管理，Catalog 需要长期持有并在析构时释放自己的 schema。如果直接保存外部指针，可能出现悬空指针或重复释放。
+
+问题：为什么 IndexInfo 使用 ShallowCopySchema？
+
+回答要点：索引 schema 只是引用表 schema 中的部分列，不应该拥有这些 Column。`ShallowCopySchema` 创建的 schema 不负责 delete 列对象，避免重复释放。
+
+问题：为什么加载 Catalog 时要先加载 Table，再加载 Index？
+
+回答要点：IndexMetadata 只保存 table_id 和 key_map。重建 IndexInfo 时需要找到对应 TableInfo 和表 schema，所以必须先加载表。
+
+问题：索引数据本身存在 Catalog 里吗？
+
+回答要点：不在。Catalog 只保存索引定义和 metadata page。B+ 树索引的数据页由 Index Manager 管理，根页位置通过 `IndexRootsPage` 持久化。
+
+问题：`key_map` 是什么？
+
+回答要点：`key_map` 表示索引列在表 schema 中的列下标。例如表列是 `(id, name, account)`，索引 `(account, id)` 的 key_map 就是 `[2, 0]`。
+
+问题：如果创建索引时表里已经有数据，应该怎么办？
+
+回答要点：应扫描整张表，对每条记录提取索引 key，并插入底层索引。否则索引只会包含创建之后插入的数据，查询结果不完整。
+
+问题：为什么 CatalogMeta 要 flush？
+
+回答要点：创建或删除表/索引会改变总目录映射。如果不写回 `CATALOG_META_PAGE_ID`，重启后数据库不知道 metadata page 在哪里。
