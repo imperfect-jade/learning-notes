@@ -3,7 +3,7 @@ course: 计算机组成
 textbook: 计算机组成与设计：硬件软件接口（RISC-V版）
 style: exam-review
 source_policy: references-section
-last_updated: 2026-05-26
+last_updated: 2026-05-28
 -->
 
 # 计算机组成
@@ -12,6 +12,62 @@ last_updated: 2026-05-26
 
 !!! tip "复习抓手"
     这门课最容易混乱的地方不是概念数量，而是层次切换。建议按“程序怎么变成指令”“指令怎么被数据通路执行”“执行时间由什么决定”“存储层次为什么有效”四条线索反复串联。
+
+## 零、复习总览与知识主线
+
+### 0.1 一句话串起全课
+
+计算机组成可以看成一条“抽象逐层落地”的链条：
+
+```text
+程序需求
+  -> 编译器选择指令
+  -> ISA 规定指令语义
+  -> 数据通路搬运数据
+  -> 控制器产生控制信号
+  -> 流水线提高吞吐
+  -> Cache/虚存缩短平均访存
+  -> I/O 与中断让外设参与系统运行
+```
+
+复习时每个知识点都要回答三个问题：
+
+1. 它解决什么瓶颈？
+2. 它改变的是 IC、CPI、Clock Cycle Time 还是 AMAT？
+3. 它由软件可见的 ISA 决定，还是硬件实现可以自由选择？
+
+### 0.2 章节之间的依赖关系
+
+| 先学内容 | 支撑后续内容 | 典型联系 |
+| --- | --- | --- |
+| 补码、浮点、数字逻辑 | ALU、数据通路、异常 | ALU 如何判断零、溢出、符号 |
+| RISC-V 指令格式 | 译码、立即数生成、控制信号 | opcode/funct 字段决定控制路径 |
+| 性能公式 | 流水线、Cache、I/O 优化 | 优化必须落到时间或 CPI 上 |
+| 单周期 CPU | 多周期、流水线 CPU | 先理解完整路径，再切阶段 |
+| 局部性 | Cache、TLB、虚拟内存 | 让“常用数据更近”成为可能 |
+| 中断与 DMA | I/O、异常、系统调用 | CPU 不可能一直轮询慢设备 |
+
+### 0.3 高频考试能力清单
+
+- 能用 \(CPU\ Time = IC \times CPI \times Cycle\ Time\) 比较两台机器或两种优化方案。
+- 能把简单 C 语句翻译成 RISC-V 指令，尤其是数组、循环、函数调用。
+- 能根据指令类型写出数据通路上经过的部件和关键控制信号。
+- 能画五级流水线时序图，判断 RAW、load-use、branch 带来的 stall/flush。
+- 能做 cache 地址划分、命中判断、AMAT 和 miss 分类。
+- 能区分 cache miss、TLB miss、page fault、中断、异常这些“看起来都会停一下”的事件。
+- 能看懂实验代码中的 ALU、RegFile、ImmGen、Control、Hazard Unit 分工。
+
+### 0.4 软件可见与硬件不可见
+
+| 角度 | 软件可见 | 硬件可自由实现 |
+| --- | --- | --- |
+| 指令 | 指令语义、寄存器编号、异常行为 | 数据通路结构、流水线级数 |
+| 存储 | 地址空间、load/store 结果 | Cache 大小、相联度、替换策略 |
+| 性能 | 程序运行时间 | 分支预测器、转发路径、预取器 |
+| I/O | 设备寄存器、系统调用语义 | 总线协议、DMA 控制器实现 |
+
+!!! note "理解标准"
+    如果一个优化不会改变程序的最终可见结果，只改变执行速度、功耗或成本，它通常属于微体系结构实现；如果改变后程序必须重新编译或行为语义变化，它更可能属于 ISA 或软件接口层面。
 
 ## 一、课程地图与系统层次
 
@@ -149,7 +205,58 @@ CPI = \sum_i (Instruction\ Fraction_i \times CPI_i)
 CPI = 0.5 \times 1 + 0.3 \times 2 + 0.2 \times 3 = 1.7
 \]
 
-### 2.4 Amdahl 定律
+### 2.4 从程序运行到性能公式
+
+完整地看，程序运行时间来自两层乘法：
+
+\[
+CPU\ Time = CPU\ Clock\ Cycles \times Clock\ Cycle\ Time
+\]
+
+\[
+CPU\ Clock\ Cycles = Instruction\ Count \times CPI
+\]
+
+合并得到：
+
+\[
+CPU\ Time = Instruction\ Count \times CPI \times Clock\ Cycle\ Time
+\]
+
+所以优化必须明确作用点：
+
+| 优化 | 主要影响 | 可能副作用 |
+| --- | --- | --- |
+| 更好算法 | 降低指令数 \(IC\) | 数据结构复杂，局部性可能变差 |
+| 编译优化 | 降低 \(IC\) 或 CPI | 编译时间增加，调试困难 |
+| 流水线 | 降低平均 CPI | 冒险、控制复杂度、周期寄存器开销 |
+| 更高主频 | 降低周期时间 | 功耗上升，可能需要更深流水线 |
+| Cache | 降低访存带来的 CPI | 命中时间、面积、功耗增加 |
+
+!!! warning "性能题常见陷阱"
+    不要把“指令更少”直接等价于“更快”。如果减少指令数的同时每条指令更复杂，CPI 或周期时间可能上升。比较方案时要把 \(IC\)、\(CPI\)、\(Clock\ Cycle\ Time\) 全部代入。
+
+### 2.5 Benchmark 与平均性能
+
+实际评价机器不能只跑一个程序。若有多个 benchmark，常见处理方式：
+
+- 对运行时间求和：适合关心一组任务总耗时。
+- 对归一化性能取几何平均：适合比较多台机器在不同程序上的相对表现。
+- 不建议简单平均主频或 MIPS，因为它们不直接等价于真实运行时间。
+
+MIPS 的定义为：
+
+\[
+MIPS = \frac{Instruction\ Count}{Execution\ Time \times 10^6}
+\]
+
+但 MIPS 可能误导：
+
+- 不同 ISA 的指令完成工作量不同。
+- 同一机器上不同程序的 MIPS 也会不同。
+- MIPS 没有直接体现程序总指令数是否增加。
+
+### 2.6 Amdahl 定律
 
 如果某部分占原运行时间比例为 \(f\)，该部分加速 \(s\) 倍，则整体加速比：
 
@@ -169,7 +276,7 @@ Speedup = \frac{1}{0.6 + \frac{0.4}{2}} = 1.25
 - 只优化少量时间占比的部分，即使局部加速巨大，整体收益也有限。
 - Amdahl 定律经常和 cache、浮点单元、并行化一起考。
 
-### 2.5 功耗与能耗
+### 2.7 功耗与能耗
 
 动态功耗常见近似：
 
@@ -271,7 +378,63 @@ Power_{dynamic} \propto C \times V^2 \times f
 
 **易错点**：大小端影响内存中字节顺序，不改变寄存器中数值本身。
 
-### 3.6 组合逻辑与时序逻辑
+### 3.6 符号扩展、零扩展与移位
+
+当一个短位宽的数被放入更宽寄存器时，需要扩展：
+
+| 扩展方式 | 做法 | 适用场景 |
+| --- | --- | --- |
+| 零扩展 | 高位补 0 | 无符号数、逻辑立即数 |
+| 符号扩展 | 高位补原最高位 | 有符号数、分支/访存偏移 |
+
+例：8 位补码 `1111 1011` 表示 \(-5\)，扩展到 16 位：
+
+```text
+1111 1011
+-> 1111 1111 1111 1011
+```
+
+如果误用零扩展：
+
+```text
+0000 0000 1111 1011 = 251
+```
+
+这会把负数变成大正数，是立即数生成器和 load 指令中非常常见的 bug。
+
+移位也要区分逻辑移位和算术移位：
+
+| 操作 | 高位补什么 | 用途 |
+| --- | --- | --- |
+| 逻辑左移 | 低位补 0 | 乘以 \(2^k\)、位操作 |
+| 逻辑右移 | 高位补 0 | 无符号除以 \(2^k\)、位字段提取 |
+| 算术右移 | 高位补符号位 | 有符号数除以 \(2^k\) 的近似 |
+
+### 3.7 布尔代数与常用组合部件
+
+常见组合逻辑部件：
+
+| 部件 | 功能 | 在 CPU 中的位置 |
+| --- | --- | --- |
+| MUX | 多路选择 | 选择 ALU 输入、写回数据、next PC |
+| Decoder | 根据编码激活某一路 | 指令译码、寄存器地址译码 |
+| Encoder | 把多路输入编码 | 中断优先级编码 |
+| Adder | 加法 | `PC+4`、地址计算、ALU |
+| Comparator | 比较 | 分支判断、cache tag 比较 |
+
+MUX 是数据通路题里最重要的图形之一。凡是“这个值可能来自两个来源”，几乎都需要 MUX：
+
+```text
+       rs2 --------+
+                   v
+              +---------+
+imm --------->|  MUX    |----> ALU input B
+              +---------+
+                   ^
+                ALUSrc
+```
+
+### 3.8 组合逻辑与时序逻辑
 
 | 类型 | 输出取决于 | 典型部件 |
 | --- | --- | --- |
@@ -328,7 +491,59 @@ Power_{dynamic} \propto C \times V^2 \times f
 
 **难点**：立即数字段在机器码中可能被拆开存放，但硬件译码后会重新拼接并符号扩展。
 
-### 4.4 算术逻辑指令
+### 4.4 指令编码字段速记
+
+RISC-V 基础整数指令通常为 32 bit，常见字段如下：
+
+| 字段 | 含义 | 常见位宽 |
+| --- | --- | ---: |
+| `opcode` | 大类操作码，决定指令格式和主控制信号 | 7 |
+| `rd` | 目的寄存器 | 5 |
+| `funct3` | 子操作码 | 3 |
+| `rs1` | 源寄存器 1 | 5 |
+| `rs2` | 源寄存器 2 | 5 |
+| `funct7` | 扩展子操作码，如区分 `add/sub` | 7 |
+| `imm` | 立即数，需根据格式拼接和符号扩展 | 不定 |
+
+R-type 的典型布局：
+
+```text
+31        25 24    20 19    15 14    12 11     7 6       0
++-----------+--------+--------+--------+--------+---------+
+|  funct7   |  rs2   |  rs1   | funct3 |   rd   | opcode  |
++-----------+--------+--------+--------+--------+---------+
+```
+
+I-type 的典型布局：
+
+```text
+31                 20 19    15 14    12 11     7 6       0
++--------------------+--------+--------+--------+---------+
+|       imm[11:0]    |  rs1   | funct3 |   rd   | opcode  |
++--------------------+--------+--------+--------+---------+
+```
+
+B-type 和 J-type 最容易错，因为立即数字段被拆散，且目标地址通常按 2 字节对齐编码。做题时不要直接按机器码连续切片，要按指令格式重新拼接。
+
+### 4.5 立即数生成 ImmGen
+
+立即数生成器要完成两件事：
+
+1. 按指令格式抽取并拼接立即数字段。
+2. 对立即数进行符号扩展，得到 ALU、branch 或 jump 可直接使用的宽度。
+
+| 格式 | 立即数用途 | 典型指令 |
+| --- | --- | --- |
+| I-type | ALU 立即数、load 偏移、`jalr` 偏移 | `addi`, `lw`, `jalr` |
+| S-type | store 偏移 | `sw` |
+| B-type | 分支目标偏移 | `beq`, `bne` |
+| U-type | 高 20 位常量 | `lui`, `auipc` |
+| J-type | 跳转目标偏移 | `jal` |
+
+!!! warning "立即数考点"
+    访存偏移和分支偏移都是字节地址意义上的偏移，但机器码中 B/J 型偏移的最低位常被隐含为 0。实验中如果 branch 跳转差 2 倍或 4 倍，优先检查立即数拼接和左移位置。
+
+### 4.6 算术逻辑指令
 
 ```asm
 # x5 = x6 + x7
@@ -352,7 +567,7 @@ xor x5, x6, x7
 -2048 \sim 2047
 \]
 
-### 4.5 Load/Store 指令
+### 4.7 Load/Store 指令
 
 RISC-V 中内存访问通常采用“基址 + 偏移”：
 
@@ -380,7 +595,7 @@ effective address
 - `sw rs2, offset(rs1)`：把寄存器 `rs2` 写入内存。
 - `offset` 是字节偏移，不是数组下标。
 
-### 4.6 分支与跳转
+### 4.8 分支与跳转
 
 ```asm
 # if (x5 == x6) goto label
@@ -417,7 +632,44 @@ else:
 done:
 ```
 
-### 4.7 数组访问示例
+### 4.9 循环翻译示例
+
+C 代码：
+
+```c
+for (int i = 0; i < n; i++) {
+    sum += A[i];
+}
+```
+
+假设：
+
+- `x10` 保存 `A` 的首地址。
+- `x11` 保存 `n`。
+- `x12` 保存 `sum`。
+- `x5` 作为 `i`。
+
+```asm
+    addi x5, x0, 0        # i = 0
+    addi x12, x0, 0       # sum = 0
+loop:
+    beq  x5, x11, done    # if i == n, exit
+    slli x6, x5, 2        # byte offset = i * 4
+    add  x7, x10, x6      # &A[i]
+    lw   x8, 0(x7)        # A[i]
+    add  x12, x12, x8     # sum += A[i]
+    addi x5, x5, 1        # i++
+    jal  x0, loop
+done:
+```
+
+**翻译技巧**：
+
+- `for` 循环通常先初始化，再在循环头判断是否结束。
+- 小于、大于等比较可以用 `slt` 配合 `bne/beq`，也可以使用汇编器提供的伪指令。
+- 数组访问一定要把元素下标换成字节偏移。
+
+### 4.10 数组访问示例
 
 C 代码：
 
@@ -441,7 +693,21 @@ sw   x6, 0(x5)       # A[i] = x6
 
 **考点**：数组下标要乘以元素字节数，`slli x, y, 2` 等价于乘 4。
 
-### 4.8 函数调用基本流程
+### 4.11 伪指令与真实指令
+
+汇编中常见的一些“指令”其实是伪指令，由汇编器展开：
+
+| 伪指令 | 可能展开 | 含义 |
+| --- | --- | --- |
+| `li rd, imm` | `addi` 或 `lui+addi` | 加载立即数 |
+| `mv rd, rs` | `addi rd, rs, 0` | 寄存器复制 |
+| `nop` | `addi x0, x0, 0` | 空操作 |
+| `j label` | `jal x0, label` | 无条件跳转 |
+| `ret` | `jalr x0, 0(ra)` | 函数返回 |
+
+考试若要求“机器指令”或“真实 RISC-V 指令”，要注意伪指令可能不能直接算作一条硬件指令。
+
+### 4.12 函数调用基本流程
 
 函数调用需要处理：
 
@@ -467,6 +733,31 @@ func:
     jalr x0, 0(ra)
 ```
 
+典型栈帧：
+
+```text
+高地址
++----------------+
+| caller frame   |
++----------------+
+| saved ra       |
+| saved s0/fp    |
+| local vars     |
+| spilled temps  |
++----------------+ <- sp
+低地址
+```
+
+调用约定要分清：
+
+| 类型 | 寄存器 | 谁负责保存 |
+| --- | --- | --- |
+| caller-saved | `t0-t6`, `a0-a7` | 调用者在调用前保存 |
+| callee-saved | `s0-s11` | 被调用者若使用就保存并恢复 |
+| special | `sp`, `ra`, `zero` | 按约定维护 |
+
+递归函数一定要保存 `ra`，因为每次 `jal` 都会覆盖返回地址。
+
 ## 五、整数与浮点算术
 
 ### 5.1 加减法器
@@ -491,6 +782,53 @@ sub = 0: A + B
 sub = 1: A + (~B) + 1 = A - B
 ```
 
+#### 5.1.1 进位、溢出与符号
+
+无符号数关心进位，有符号补码数关心溢出：
+
+| 情况 | 判断对象 | 例子 |
+| --- | --- | --- |
+| 无符号加法 | 最高位是否产生进位 | `255 + 1` 在 8 位无符号中回到 0 |
+| 有符号加法 | 同号相加结果异号 | `127 + 1` 在 8 位补码中变成 -128 |
+| 无符号减法 | 是否需要借位 | `0 - 1` 在 8 位无符号中变成 255 |
+| 有符号减法 | 转成加法后判断溢出 | `A - B = A + (-B)` |
+
+硬件中常见的有符号溢出判断：
+
+\[
+Overflow = Carry_{in\ to\ MSB} \oplus Carry_{out\ of\ MSB}
+\]
+
+也可以从符号位理解：
+
+- 正数 + 正数得到负数：溢出。
+- 负数 + 负数得到正数：溢出。
+- 正数 + 负数：不会溢出。
+
+#### 5.1.2 加法器延迟
+
+最简单的 ripple-carry adder 让进位逐位传播：
+
+```text
+bit0 -> bit1 -> bit2 -> ... -> bit31
+```
+
+优点是结构简单，缺点是延迟随位宽增长。更快的加法器会提前计算 generate/propagate：
+
+\[
+G_i = A_i \cdot B_i
+\]
+
+\[
+P_i = A_i \oplus B_i
+\]
+
+\[
+C_{i+1} = G_i + P_i C_i
+\]
+
+这类思想用于 carry-lookahead adder，核心是减少长进位链造成的关键路径。
+
 ### 5.2 乘法
 
 二进制乘法和十进制竖式类似，本质是移位加法。
@@ -512,6 +850,25 @@ sub = 1: A + (~B) + 1 = A - B
 - 两个 \(n\) 位数相乘，结果最多需要 \(2n\) 位。
 - 乘法器比加法器复杂，常见实现会在多个周期内迭代完成。
 - 有符号乘法要处理符号扩展或使用 Booth 算法思想。
+
+#### 5.2.1 乘法器实现思路
+
+一个顺序乘法器通常包含：
+
+- 被乘数寄存器。
+- 乘数/乘积寄存器。
+- 加法器。
+- 控制逻辑，决定当前位为 1 时是否加被乘数。
+
+迭代思想：
+
+```text
+for each bit of multiplier:
+    if current bit == 1:
+        product += multiplicand shifted by bit position
+```
+
+Booth 算法利用连续 1 的模式减少加减次数，适合有符号乘法和较长连续位模式。
 
 ### 5.3 除法
 
@@ -583,6 +940,33 @@ Bias = 127
 !!! warning "浮点易错点"
     浮点数不是实数。它有有限精度，很多十进制小数无法精确表示，因此浮点比较应避免直接判断相等。
 
+### 5.7 浮点数复习重点
+
+浮点题通常围绕三件事：
+
+1. 能否从 sign/exponent/fraction 还原数值。
+2. 能否解释规格化数、非规格化数、0、无穷、NaN。
+3. 能否说明浮点加法为什么要对阶、规格化和舍入。
+
+规格化数的指数范围不直接等于 exponent 字段值，而是：
+
+\[
+E_{real} = E_{stored} - Bias
+\]
+
+单精度中，若 `exponent = 130`，则真实指数：
+
+\[
+E_{real} = 130 - 127 = 3
+\]
+
+**易错点**：
+
+- fraction 字段不存隐含前导 1，但规格化数计算时要补上。
+- 非规格化数没有隐含前导 1。
+- 浮点加法中小数可能因对阶右移而丢失精度。
+- 浮点乘法要处理符号异或、指数相加再减 bias、尾数相乘、规格化和舍入。
+
 ## 六、处理器数据通路与控制
 
 ### 6.1 单周期 CPU 总览
@@ -640,7 +1024,56 @@ rs1/rs2 -> +---------+      +-----+
 | `Branch` | 是否为条件分支 |
 | `ALUOp` | 指示 ALU 运算类型 |
 
-### 6.4 不同指令的数据路径
+### 6.4 主控制器与 ALU 控制器
+
+控制通常分两层：
+
+```text
+Instruction opcode
+      |
+      v
+Main Control -----> RegWrite / MemRead / MemWrite / ALUSrc / Branch ...
+      |
+      v
+    ALUOp ----+
+              v
+funct3/funct7 -> ALU Control -> ALUCtrl
+```
+
+这样设计的好处是主控制器只根据 opcode 判断大类，ALU 控制器再根据 funct 字段区分具体运算。
+
+| 指令类型 | 主控制器关心 | ALU 控制器关心 |
+| --- | --- | --- |
+| R-type | 需要写回、ALU 第二输入来自 `rs2` | `funct3/funct7` 决定加减与逻辑操作 |
+| I-type ALU | 需要写回、ALU 第二输入来自立即数 | `funct3` 决定操作 |
+| Load/Store | 需要 ALU 做地址加法 | 通常固定为 add |
+| Branch | 不写回，ALU/比较器判断条件 | 比较类型，如相等/不等/小于 |
+
+### 6.5 立即数、控制信号与数据的同步
+
+单周期 CPU 中所有逻辑都在一个周期内完成，控制信号不需要保存；流水线 CPU 中控制信号必须和数据一起进入流水线寄存器：
+
+```text
+ID 阶段产生控制信号
+      |
+      v
+ID/EX.RegWrite, MemRead, MemWrite, ALUSrc ...
+      |
+      v
+EX/MEM.MemRead, MemWrite, RegWrite ...
+      |
+      v
+MEM/WB.RegWrite, MemToReg ...
+```
+
+如果忘记让控制信号随指令流动，常见现象是：
+
+- 错误指令写回寄存器。
+- store 在不该写内存时写内存。
+- load 的数据没有进入写回 MUX。
+- branch 后错误路径的控制信号没有被清零。
+
+### 6.6 不同指令的数据路径
 
 #### R-type: `add rd, rs1, rs2`
 
@@ -701,7 +1134,40 @@ PC -> 指令存储器 -> 读 rs1/rs2 -> ALU 比较 -> 选择 next PC
 Branch\ Target = PC + SignExt(Immediate)
 \]
 
-### 6.5 关键路径
+### 6.7 数据通路题的标准写法
+
+遇到“某条指令经过哪些部件”或“填写控制信号”的题，按以下步骤：
+
+1. 判断指令格式：R/I/S/B/U/J。
+2. 列源寄存器和目的寄存器：`rs1`、`rs2`、`rd` 是否存在。
+3. 判断 ALU 做什么：加地址、加减逻辑、比较、生成目标地址。
+4. 判断是否访问数据存储器：load 读、store 写，其余通常不访问。
+5. 判断是否写回寄存器：store/branch 不写回，load/ALU/jump 通常写回。
+6. 判断 next PC：默认 `PC+4`，branch/jump 可能改写。
+
+例：`lw x5, 12(x6)`
+
+```text
+PC -> I-Mem -> Decode
+rs1=x6 -> RegFile -> ALU
+imm=12 -> ALU
+ALU result = x6 + 12 -> D-Mem read
+D-Mem data -> WriteBack MUX -> x5
+next PC = PC + 4
+```
+
+关键控制信号：
+
+| 信号 | 值 | 原因 |
+| --- | --- | --- |
+| `RegWrite` | 1 | load 要写回 `rd` |
+| `ALUSrc` | 1 | 地址偏移来自立即数 |
+| `MemRead` | 1 | 需要读内存 |
+| `MemWrite` | 0 | 不写内存 |
+| `MemToReg` | 1 | 写回值来自内存 |
+| `Branch` | 0 | 不是分支 |
+
+### 6.8 关键路径
 
 单周期 CPU 的时钟周期必须覆盖最慢指令的最长路径。
 
@@ -716,7 +1182,25 @@ PC -> I-Mem -> RegFile -> ALU -> D-Mem -> MUX -> RegFile
 - 单周期 CPU 简单，但所有指令都被最慢指令拖慢。
 - 这也是引入多周期 CPU 和流水线 CPU 的动机。
 
-### 6.6 Verilog 风格的控制逻辑示例
+### 6.9 多周期 CPU 的动机
+
+多周期 CPU 把一条指令拆成多个较短周期执行：
+
+```text
+IF -> ID -> EX -> MEM -> WB
+```
+
+和单周期相比：
+
+| 实现 | 优点 | 缺点 |
+| --- | --- | --- |
+| 单周期 | 控制简单，一条指令一个周期 | 周期必须按最慢指令设置 |
+| 多周期 | 不同指令可用不同周期数，部件可复用 | 控制器更复杂，CPI 大于 1 |
+| 流水线 | 多条指令重叠，吞吐率高 | 冒险处理复杂 |
+
+多周期 CPU 常用有限状态机控制，每个状态做一部分工作，例如取指、译码、执行、访存、写回。
+
+### 6.10 Verilog 风格的控制逻辑示例
 
 ```verilog
 always @(*) begin
@@ -823,6 +1307,33 @@ add 结果
   MEM/WB --------+
 ```
 
+#### 7.5.1 转发条件
+
+以五级流水线为例，EX 阶段需要的两个源操作数来自 `ID/EX.rs1` 和 `ID/EX.rs2`。若前面指令将结果写入这些寄存器，就需要转发。
+
+从 EX/MEM 转发：
+
+```text
+if EX/MEM.RegWrite
+   and EX/MEM.rd != 0
+   and EX/MEM.rd == ID/EX.rs1:
+       ForwardA = EX/MEM
+```
+
+从 MEM/WB 转发：
+
+```text
+if MEM/WB.RegWrite
+   and MEM/WB.rd != 0
+   and MEM/WB.rd == ID/EX.rs1:
+       ForwardA = MEM/WB
+```
+
+`rs2` 对应 `ForwardB`，判断方式相同。
+
+!!! note "优先级"
+    如果 EX/MEM 和 MEM/WB 都能转发同一个寄存器，通常优先使用 EX/MEM，因为它更新，距离当前指令更近。
+
 ### 7.6 Load-use 冒险
 
 例：
@@ -847,6 +1358,27 @@ addi x10, x10, 1    # 插入无关指令填空
 add x7, x5, x8
 ```
 
+#### 7.6.1 Load-use 检测条件
+
+典型检测逻辑：
+
+```text
+if ID/EX.MemRead
+   and (
+        ID/EX.rd == IF/ID.rs1
+        or ID/EX.rd == IF/ID.rs2
+   ):
+       stall pipeline
+```
+
+处理动作通常包括：
+
+- PCWrite = 0：PC 保持不变。
+- IF/IDWrite = 0：IF/ID 寄存器保持不变。
+- ID/EX 控制信号清零：插入 bubble。
+
+这解释了为什么时间表中后一条指令的 IF/ID 会“卡住”，而 EX 阶段出现一个空泡。
+
 ### 7.7 控制冒险
 
 分支指令在真正比较前，CPU 不确定下一条指令地址。
@@ -861,6 +1393,26 @@ add x7, x5, x8
 
 !!! note "考试写法"
     遇到流水线题，先画时间表，再标出依赖关系，最后判断能否通过转发解决。不要凭感觉数 stall。
+
+#### 7.7.1 分支提前判断
+
+若在 EX 阶段才知道分支结果，错误路径可能已经取入多条指令。为了减少 penalty，可以把分支比较和目标地址计算提前到 ID 阶段，但这会带来新问题：
+
+- ID 阶段需要比较器。
+- 分支源寄存器可能也需要转发。
+- ID 阶段组合逻辑变长，可能影响时钟周期。
+
+所以“提前分支判断”减少 CPI，但可能增加周期时间，仍需回到性能公式综合判断。
+
+#### 7.7.2 flush 与 stall 的区别
+
+| 动作 | 含义 | 典型场景 |
+| --- | --- | --- |
+| stall | 正确指令暂时不能前进 | load-use、结构资源冲突 |
+| bubble | 插入一条空操作 | 为等待数据制造空周期 |
+| flush | 已经进入流水线的指令不该执行，清除其控制信号 | 分支预测错误、跳转改 PC |
+
+一句话：stall 是“等等再走”，flush 是“这条路走错了，清掉”。
 
 ### 7.8 流水线时间表例题
 
@@ -882,6 +1434,43 @@ sub:           IF  IF  ID  EX  MEM WB
 ```
 
 **注意**：停顿时 PC 和 IF/ID 往往保持不变，ID/EX 插入 bubble。
+
+### 7.9 异常与流水线
+
+异常（exception）是在指令执行过程中由当前指令触发的事件，例如非法指令、算术溢出、缺页等。流水线中处理异常要保证精确异常（precise exception）：
+
+- 异常之前的指令都已经完成。
+- 异常之后的指令看起来还没有执行。
+- 处理程序能准确知道是哪条指令触发异常。
+
+这要求处理器能够清除异常指令之后的流水线状态，并保存异常原因和异常 PC。
+
+### 7.10 流水线性能计算模板
+
+若理想 CPI 为 1，额外停顿来自 load-use、branch miss、cache miss：
+
+\[
+CPI = 1 + Stall_{load} + Stall_{branch} + Stall_{cache}
+\]
+
+例如：
+
+- 20% 指令是 load。
+- 其中 30% 发生 load-use，停顿 1 cycle。
+- 15% 指令是 branch。
+- 分支预测错误率 20%，错误代价 2 cycle。
+
+\[
+Stall_{load} = 0.20 \times 0.30 \times 1 = 0.06
+\]
+
+\[
+Stall_{branch} = 0.15 \times 0.20 \times 2 = 0.06
+\]
+
+\[
+CPI = 1 + 0.06 + 0.06 = 1.12
+\]
 
 ## 八、存储层次与 Cache
 
@@ -986,6 +1575,66 @@ Index = \log_2 1024 = 10
 Tag = 32 - 10 - 4 = 18
 \]
 
+#### 8.6.1 命中判断步骤
+
+给一个地址，判断 cache 是否命中：
+
+1. 用 block size 算出 block offset 位数。
+2. 用 set 数算出 index 位数。
+3. 剩余高位作为 tag。
+4. 根据 index 找到对应 set。
+5. 比较该 set 中每个有效块的 tag。
+6. tag 相同且 valid bit 为 1，则 hit；否则 miss。
+
+例：直接映射 cache，有 4 个 line，每块 4 byte，地址为字节地址。
+
+```text
+block offset = log2(4) = 2 bit
+index        = log2(4) = 2 bit
+```
+
+地址 `0x00000014`：
+
+```text
+0x14 = 20 = 0001 0100b
+block offset = 00
+index        = 01
+tag          = 剩余高位
+```
+
+因此它只能放到 index=1 的 cache line 中。
+
+#### 8.6.2 访问序列模拟例题
+
+直接映射 cache，4 个 line，每块 4 byte，初始为空。访问地址：
+
+```text
+0, 4, 8, 0, 16, 4
+```
+
+块号为地址除以 4：
+
+| 地址 | 块号 | index = 块号 mod 4 | 结果 |
+| ---: | ---: | ---: | --- |
+| 0 | 0 | 0 | miss，装入块 0 |
+| 4 | 1 | 1 | miss，装入块 1 |
+| 8 | 2 | 2 | miss，装入块 2 |
+| 0 | 0 | 0 | hit |
+| 16 | 4 | 0 | miss，替换块 0 |
+| 4 | 1 | 1 | hit |
+
+命中率：
+
+\[
+Hit\ Rate = \frac{2}{6}
+\]
+
+缺失率：
+
+\[
+Miss\ Rate = \frac{4}{6}
+\]
+
 ### 8.7 Cache 缺失分类
 
 | 类型 | 原因 | 改进方式 |
@@ -1004,7 +1653,58 @@ Tag = 32 - 10 - 4 = 18
 | Write-allocate | 写 miss 时把块调入 cache 再写 | 适合 write-back |
 | No-write-allocate | 写 miss 时直接写下层 | 常配 write-through |
 
-### 8.9 虚拟内存
+### 8.9 替换策略与 dirty/valid 位
+
+每个 cache line 通常至少包含：
+
+| 字段 | 作用 |
+| --- | --- |
+| valid bit | 当前 line 是否保存有效数据 |
+| tag | 判断是否是目标内存块 |
+| data block | 实际缓存的数据 |
+| dirty bit | write-back cache 中表示该块是否被修改过 |
+
+组相联 cache 在 set 满时需要替换策略：
+
+| 策略 | 思想 | 特点 |
+| --- | --- | --- |
+| Random | 随机替换 | 硬件简单 |
+| FIFO | 替换最早进入的块 | 不一定符合最近使用情况 |
+| LRU | 替换最久未使用的块 | 效果好，但高相联度下硬件复杂 |
+| Pseudo-LRU | 近似 LRU | 实际处理器常见折中 |
+
+write-back cache 替换 dirty block 时必须写回下层存储；替换 clean block 时可以直接丢弃。
+
+### 8.10 多级 Cache
+
+现代处理器常有 L1/L2/L3 多级缓存：
+
+```text
+CPU -> L1 I-cache / L1 D-cache -> L2 -> L3 -> Memory
+```
+
+多级 AMAT 可递归计算：
+
+\[
+AMAT = HitTime_{L1} + MissRate_{L1} \times MissPenalty_{L1}
+\]
+
+若 L1 miss 后访问 L2：
+
+\[
+MissPenalty_{L1} = HitTime_{L2} + MissRate_{L2} \times MissPenalty_{L2}
+\]
+
+所以：
+
+\[
+AMAT = HitTime_{L1} + MissRate_{L1} \times (HitTime_{L2} + MissRate_{L2} \times MissPenalty_{L2})
+\]
+
+!!! note "局部 miss rate 与全局 miss rate"
+    L2 的局部 miss rate 是“到达 L2 的访问中有多少 miss”；全局 miss rate 是“所有 CPU 访存中有多少一路 miss 到 L2 之后”。题目中要看清分母。
+
+### 8.11 虚拟内存
 
 虚拟内存提供三个核心能力：
 
@@ -1023,7 +1723,7 @@ Virtual Address
       +---- miss -> Page Table lookup
 ```
 
-### 8.10 页表与 TLB
+### 8.12 页表与 TLB
 
 | 结构 | 作用 |
 | --- | --- |
@@ -1037,6 +1737,48 @@ Virtual Address
 - cache miss 通常由硬件处理。
 - page fault 通常需要操作系统处理，代价远高于 cache miss。
 - TLB miss 不一定是 page fault，可能只是页表项不在 TLB 中。
+
+### 8.13 地址转换与 Cache 的关系
+
+典型访问路径：
+
+```text
+Virtual Address
+      |
+      v
+TLB / Page Table
+      |
+      v
+Physical Address
+      |
+      v
+Cache
+      |
+      v
+Memory
+```
+
+容易混淆的几个事件：
+
+| 事件 | 发生位置 | 含义 | 处理代价 |
+| --- | --- | --- | --- |
+| TLB hit | 地址转换 | 页表项在 TLB 中 | 很低 |
+| TLB miss | 地址转换 | TLB 中没有页表项 | 查页表，可能硬件或 OS |
+| Page fault | 虚拟内存 | 页不在物理内存或权限错误 | 很高，需要 OS |
+| Cache hit | 数据访问 | 数据在 cache 中 | 低 |
+| Cache miss | 数据访问 | 数据不在 cache 中 | 从下层存储取块 |
+
+**判断顺序**：先完成地址转换，再用物理地址访问 cache。若 page fault，通常不会继续做普通 cache 访问。
+
+### 8.14 Cache 优化方向
+
+| 优化 | 降低什么 | 可能代价 |
+| --- | --- | --- |
+| 增大 block | 降低 compulsory miss，利用空间局部性 | miss penalty 增大，污染 cache |
+| 增大 cache | 降低 capacity miss | 命中时间、面积、功耗增加 |
+| 提高相联度 | 降低 conflict miss | tag 比较更多，命中路径变慢 |
+| 多级 cache | 降低主存访问代价 | 层次一致性复杂 |
+| 预取 | 提前取可能访问的数据 | 预测错误会浪费带宽 |
 
 ## 九、存储与 I/O
 
@@ -1076,6 +1818,29 @@ void put_char(char c) {
 | Interrupt | 设备准备好后打断 CPU | CPU 利用率高 | 中断处理有开销 |
 | DMA | 设备直接和内存传输数据 | 适合大块数据 | 控制逻辑复杂，需要一致性处理 |
 
+#### 9.3.1 三种方式的选择
+
+| 场景 | 更适合方式 | 原因 |
+| --- | --- | --- |
+| 极简单、很少发生的小设备操作 | Polling | 实现简单，等待成本可接受 |
+| 键盘、网卡等异步事件 | Interrupt | 设备不定时发生，CPU 不应空等 |
+| 磁盘、网卡大块数据传输 | DMA | 数据量大，逐字节中断开销过高 |
+
+DMA 的典型流程：
+
+```text
+CPU 设置 DMA 描述符
+  -> DMA 控制器从设备搬运数据到内存
+  -> 搬运完成后产生中断
+  -> CPU 检查状态并继续处理数据
+```
+
+DMA 与 cache 的一致性要特别小心：
+
+- 设备写内存后，CPU cache 中可能还有旧数据。
+- CPU 写了 cache 但没写回内存，设备可能读到旧数据。
+- 系统常通过 cache flush/invalidate、不可缓存映射或一致性互连解决。
+
 ### 9.4 中断基本流程
 
 ```text
@@ -1088,7 +1853,17 @@ void put_char(char c) {
   -> 回到原程序继续执行
 ```
 
-### 9.5 存储设备
+### 9.5 异常、中断与系统调用
+
+| 事件 | 来源 | 同步/异步 | 例子 |
+| --- | --- | --- | --- |
+| Exception | 当前指令执行内部 | 同步 | 非法指令、除零、page fault |
+| Interrupt | 外部设备 | 异步 | 定时器、键盘、网卡 |
+| System call | 程序主动请求 OS 服务 | 同步 | 文件读写、进程控制 |
+
+同步的意思是与当前指令执行位置相关；异步的意思是可能在指令之间由外部设备触发。
+
+### 9.6 存储设备
 
 | 设备 | 特点 | 性能瓶颈 |
 | --- | --- | --- |
@@ -1097,6 +1872,29 @@ void put_char(char c) {
 | RAID | 多磁盘组合 | 性能、容量、可靠性权衡 |
 
 **复习点**：I/O 章节常与可靠性、冗余、带宽、延迟联系，不要只背设备名。
+
+### 9.7 RAID 速查
+
+RAID 用多块磁盘组合提高容量、性能或可靠性：
+
+| RAID | 思想 | 优点 | 缺点 |
+| --- | --- | --- | --- |
+| RAID 0 | 条带化，无冗余 | 性能高、容量利用率高 | 任一磁盘坏都会丢数据 |
+| RAID 1 | 镜像 | 可靠性高，读性能可提高 | 容量利用率低 |
+| RAID 4 | 块级条带 + 专用校验盘 | 可恢复单盘故障 | 校验盘成为写瓶颈 |
+| RAID 5 | 块级条带 + 分布式校验 | 避免单校验盘热点 | 小写仍需读改写校验 |
+
+奇偶校验的核心思想：用异或保存冗余信息。
+
+\[
+P = D_0 \oplus D_1 \oplus D_2
+\]
+
+若 \(D_1\) 丢失：
+
+\[
+D_1 = P \oplus D_0 \oplus D_2
+\]
 
 ## 十、实验与实现要点
 
@@ -1183,7 +1981,54 @@ endmodule
 - 读通常是组合逻辑，写通常在时钟沿。
 - 同周期读写同一寄存器时，要按实验框架约定处理。
 
-### 10.4 单周期 CPU 调试顺序
+### 10.4 立即数生成器示例
+
+立即数生成器是 RISC-V CPU 实验中最容易写错的模块之一：
+
+```verilog
+module imm_gen(
+    input  [31:0] instr,
+    output reg [31:0] imm
+);
+    wire [6:0] opcode = instr[6:0];
+
+    always @(*) begin
+        case (opcode)
+            7'b0010011,  // I-type ALU
+            7'b0000011,  // load
+            7'b1100111:  // jalr
+                imm = {{20{instr[31]}}, instr[31:20]};
+
+            7'b0100011:  // store
+                imm = {{20{instr[31]}}, instr[31:25], instr[11:7]};
+
+            7'b1100011:  // branch
+                imm = {{19{instr[31]}}, instr[31], instr[7],
+                       instr[30:25], instr[11:8], 1'b0};
+
+            7'b0110111,  // lui
+            7'b0010111:  // auipc
+                imm = {instr[31:12], 12'b0};
+
+            7'b1101111:  // jal
+                imm = {{11{instr[31]}}, instr[31], instr[19:12],
+                       instr[20], instr[30:21], 1'b0};
+
+            default:
+                imm = 32'b0;
+        endcase
+    end
+endmodule
+```
+
+检查点：
+
+- I/S/B/J 型都要符号扩展。
+- B/J 型最低位补 0。
+- U 型低 12 位补 0。
+- 不要把 `instr[11:7]` 当成所有格式的 `rd`，S/B 型这里是立即数字段的一部分。
+
+### 10.5 单周期 CPU 调试顺序
 
 1. PC 能否正确 `+4`。
 2. 指令存储器是否按 PC 取出正确指令。
@@ -1196,7 +2041,7 @@ endmodule
 9. 写回 MUX 是否选择正确来源。
 10. 用小程序逐条跟踪寄存器和内存变化。
 
-### 10.5 流水线 CPU 调试顺序
+### 10.6 流水线 CPU 调试顺序
 
 1. 先让无冒险指令序列跑通。
 2. 加入 ALU-ALU 数据冒险，检查 EX/MEM 和 MEM/WB 转发。
@@ -1220,6 +2065,49 @@ stall
 flush
 forwardA / forwardB
 ```
+
+### 10.7 Testbench 编写建议
+
+实验不要只靠波形肉眼看，应尽量写自检式 testbench：
+
+```verilog
+initial begin
+    a = 32'd10;
+    b = 32'd3;
+    alu_ctrl = 4'b0000; #1;
+    if (result !== 32'd13) $fatal("add failed");
+
+    alu_ctrl = 4'b0001; #1;
+    if (result !== 32'd7) $fatal("sub failed");
+
+    alu_ctrl = 4'b0010; #1;
+    if (result !== (32'd10 & 32'd3)) $fatal("and failed");
+
+    $display("ALU tests passed");
+end
+```
+
+建议按模块层次逐步测试：
+
+1. ALU：加减、位运算、零标志。
+2. RegFile：`x0` 恒零、读写、同时读两个端口。
+3. ImmGen：每种格式各测一个正立即数和负立即数。
+4. Control：每类指令的控制信号。
+5. Single-cycle CPU：逐条执行小程序，检查寄存器最终值。
+6. Pipeline CPU：先无冒险，再加转发、stall、flush。
+
+### 10.8 常见实验 bug 对照表
+
+| 现象 | 可能原因 | 排查点 |
+| --- | --- | --- |
+| `x0` 被写成非零 | RegFile 未屏蔽 `rd=0` 写入 | 写端口判断 `rd != 0` |
+| 分支跳转地址不对 | B 型立即数拼接或左移错 | `instr[7]`、`instr[11:8]` 位置 |
+| `lw` 读错地址 | ALU 输入 B 没选立即数 | `ALUSrc`、ImmGen |
+| `sw` 写错数据 | store 数据端误接 `rd` 或写回数据 | 应使用 `rs2` 读数 |
+| R-type 加减混淆 | ALU control 没看 `funct7` | `add/sub` opcode/funct3 相同 |
+| load-use 结果错 | 没有插入 stall | hazard detection |
+| branch 后多执行一条错指令 | flush 控制信号没清零 | IF/ID 或 ID/EX flush |
+| 仿真出现锁存器 | 组合逻辑未给默认值 | `always @(*)` 中默认赋值 |
 
 ## 十一、常见题型与解题模板
 
@@ -1370,5 +2258,5 @@ CPU Time = 1,000,000 * 1.5 / (2 * 10^9)
 ## 十五、参考资料
 
 - David A. Patterson, John L. Hennessy.《计算机组成与设计：硬件软件接口（RISC-V版）》。
-- WintermelonC Docs：[计算机组成](https://wintermelonc.github.io/WintermelonC_Docs/zju/compulsory_courses/computer_organization/)，用于参考课程章节结构、RISC-V 相关资料入口、理论与实验部分脉络。
+- WintermelonC Docs：[计算机组成](https://wintermelonc.github.io/WintermelonC_Docs/zju/compulsory_courses/computer_organization/)（访问日期：2026-05-28），用于参考课程章节结构、RISC-V 相关资料入口、理论与实验部分脉络。
 - WintermelonC Docs 课程章节：Computer Abstractions and Technology、Instructions: Language of the Computer、Arithmetic for Computers、The Processor、Large and Fast: Exploiting Memory Hierarchy、Storage and Other I/O Topics。

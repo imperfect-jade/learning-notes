@@ -63,10 +63,14 @@
 | 已讲解 | 4.1 Catalog Manager 概览 | 见“实验四” |
 | 已讲解 | 4.2 Catalog / Table / Index 元信息持久化 | 见“实验四” |
 | 已讲解 | 4.3 表和索引的创建、加载、删除 | 见“实验四” |
+| 已讲解 | 5.1 Planner / Executor 概览 | 见“实验五” |
+| 已讲解 | 5.2 火山模型与执行计划 | 见“实验五” |
+| 已讲解 | 5.3 SeqScan / IndexScan / Insert / Update / Delete | 见“实验五” |
+| 已讲解 | 5.4 ExecuteEngine 与 SQL 命令 | 见“实验五” |
 
 ## 下一步
 
-建议按实验顺序推进。当前讲解已经覆盖实验一到实验四，下一节将进入 `Planner and Executor`，也就是把 SQL 语法树转成执行动作并调用前面实现的表、索引和目录模块。
+建议按实验顺序推进。当前讲解已经覆盖实验一到实验五，下一节将进入 `Recovery Manager`，重点是日志结构、Redo、Undo 和崩溃恢复。
 
 ## 实验一：Disk and Buffer Pool Manager
 
@@ -3944,3 +3948,1109 @@ make catalog_test -j
 问题：为什么 CatalogMeta 要 flush？
 
 回答要点：创建或删除表/索引会改变总目录映射。如果不写回 `CATALOG_META_PAGE_ID`，重启后数据库不知道 metadata page 在哪里。
+
+## 实验五：Planner and Executor
+
+### 1. 实验目标
+
+实验五要把前面四个实验做好的底层能力真正组织成“能执行 SQL 的数据库”。前面你已经有了：
+
+1. Disk / Buffer：能读写页。
+2. Record：能把表中的记录组织起来。
+3. Index：能用 B+ 树加速查找。
+4. Catalog：能知道有哪些表、哪些列、哪些索引。
+
+这一节要完成的事情就是：
+
+```text
+SQL 语法树
+  -> Planner 生成执行计划 Plan
+  -> ExecuteEngine 创建 Executor
+  -> Executor 调用 Catalog / TableHeap / Index
+  -> 返回查询结果或修改表数据
+```
+
+对应文件：
+
+- `src/include/executor/execute_engine.h`
+- `src/executor/execute_engine.cpp`
+- `src/include/executor/execute_context.h`
+- `src/include/executor/executors/abstract_executor.h`
+- `src/include/executor/executors/seq_scan_executor.h`
+- `src/executor/seq_scan_executor.cpp`
+- `src/include/executor/executors/index_scan_executor.h`
+- `src/executor/index_scan_executor.cpp`
+- `src/include/executor/executors/values_executor.h`
+- `src/executor/values_executor.cpp`
+- `src/include/executor/executors/insert_executor.h`
+- `src/executor/insert_executor.cpp`
+- `src/include/executor/executors/delete_executor.h`
+- `src/executor/delete_executor.cpp`
+- `src/include/executor/executors/update_executor.h`
+- `src/executor/update_executor.cpp`
+- `src/include/executor/plans/*.h`
+- `src/include/planner/planner.h`
+- `src/planner/planner.cpp`
+- `src/include/planner/expressions/*.h`
+- `test/execution/executor_test.cpp`
+
+对应测试：
+
+```bash
+make executor_test -j
+./test/executor_test
+```
+
+这一节的测试重点不再是单个页或单个元信息对象，而是完整执行链路：
+
+- `SimpleSeqScanTest`：顺序扫描表，执行 `WHERE id < 500`，返回 500 行。
+- `SimpleDeleteTest`：通过索引找到 `id = 50` 的记录，删除后表和索引都不能再查到它。
+- `SimpleRawInsertTest`：插入一条新记录，再扫描验证它存在。
+- `SimpleUpdateTest`：更新 `id = 500` 的记录，再扫描验证字段值已改变。
+
+### 2. 相关数据库知识
+
+#### 2.1 SQL 是怎么被执行的
+
+真实数据库执行一条 SQL，通常会经历这些阶段：
+
+```text
+SQL 字符串
+  -> Parser：词法 / 语法分析，生成语法树 AST
+  -> Binder：把表名、列名绑定到 Catalog 中的真实对象
+  -> Planner：生成逻辑或物理执行计划
+  -> Optimizer：选择更好的计划，例如是否走索引
+  -> Executor：真正读写表和索引
+```
+
+MiniSQL 做了一个简化版本：
+
+1. Parser 已经由框架提供，输出 `SyntaxNode` 语法树。
+2. Binder 的工作大多揉进了 `Planner` 和 `ExecuteEngine`。
+3. Planner 会把 `select / insert / delete / update` 转成 `PlanNode`。
+4. Executor 根据 `PlanNode` 执行。
+5. `create table / drop table / create index / drop index / show` 这类命令大多由 `ExecuteEngine` 直接处理。
+
+这就是为什么实验五同时包含两个方向：
+
+- DML：`select / insert / delete / update`，需要 Planner + Executor。
+- DDL / Utility：`create table / drop table / create index / drop index / show / execfile / quit`，主要在 `ExecuteEngine` 里调 Catalog。
+
+#### 2.2 Planner 和 Executor 的分工
+
+`Planner` 回答的是：
+
+```text
+这条 SQL 应该用什么执行步骤？
+```
+
+例如：
+
+```sql
+select id, name from table-1 where id < 500;
+```
+
+Planner 可能生成：
+
+```text
+SeqScanPlanNode
+  table = table-1
+  predicate = id < 500
+  output_schema = (id, name)
+```
+
+如果条件能利用索引，例如：
+
+```sql
+select * from table-1 where id = 50;
+```
+
+Planner 也可能生成：
+
+```text
+IndexScanPlanNode
+  table = table-1
+  indexes = [id_index]
+  predicate = id = 50
+```
+
+`Executor` 回答的是：
+
+```text
+给我一个计划，我具体怎么一行一行产出结果？
+```
+
+所以不要把两者混在一起。Planner 不应该真的遍历表；Executor 不应该重新解析 SQL。
+
+#### 2.3 什么是执行计划 PlanNode
+
+执行计划可以理解成“执行器的说明书”。本实验中常见的 PlanNode 有：
+
+| PlanNode | 作用 |
+| --- | --- |
+| `SeqScanPlanNode` | 顺序扫描整张表，根据 predicate 过滤，再按 output schema 投影 |
+| `IndexScanPlanNode` | 使用一个或多个索引找 RowId，再必要时回表过滤 |
+| `ValuesPlanNode` | 保存 `insert values (...)` 中的常量行 |
+| `InsertPlanNode` | 从子执行器读取行，插入目标表 |
+| `DeletePlanNode` | 从子执行器读取要删的行，删除表记录和索引项 |
+| `UpdatePlanNode` | 从子执行器读取要更新的行，生成新行并更新表和索引 |
+
+注意 `Insert / Delete / Update` 都可能有子计划：
+
+```text
+InsertPlan
+  child = ValuesPlan
+
+DeletePlan
+  child = SeqScanPlan 或 IndexScanPlan
+
+UpdatePlan
+  child = SeqScanPlan 或 IndexScanPlan
+```
+
+这说明执行计划天然是一棵树，而不是一条简单链。
+
+#### 2.4 火山模型 Volcano Iterator Model
+
+本实验的执行器采用经典的 Volcano 模型，也叫 Iterator 模型。每个执行器都有两个核心函数：
+
+```cpp
+void Init();
+bool Next(Row *row, RowId *rid);
+```
+
+含义：
+
+- `Init()`：初始化执行器状态，例如拿到表信息、设置迭代器起点、初始化子执行器。
+- `Next()`：每调用一次，尝试产出一行结果；有结果返回 `true`，没结果返回 `false`。
+
+`ExecuteEngine::ExecutePlan` 的逻辑正是：
+
+```text
+executor.Init()
+while executor.Next(row, rid):
+  result_set.push_back(row)
+```
+
+火山模型的好处是每个算子都只需要关心“我要怎么产出下一行”。例如：
+
+```text
+SeqScanExecutor.Next()
+  从 TableHeap 拿下一行
+  判断 predicate
+  通过则返回
+  不通过继续找下一行
+
+InsertExecutor.Next()
+  从 child_executor 拿下一行
+  插入 TableHeap
+  插入所有相关索引
+```
+
+这是一种非常重要的数据库执行器思想。以后你看 PostgreSQL、BusTub、SQLite 的执行器，都会看到类似接口。
+
+#### 2.5 Predicate 和 Expression
+
+`WHERE id < 500 AND name = 'abc'` 不是一段字符串，而是一棵表达式树：
+
+```text
+AND
+  <
+    ColumnValue(id)
+    ConstantValue(500)
+  =
+    ColumnValue(name)
+    ConstantValue('abc')
+```
+
+本项目中的表达式类在：
+
+- `src/include/planner/expressions/abstract_expression.h`
+- `src/include/planner/expressions/column_value_expression.h`
+- `src/include/planner/expressions/constant_value_expression.h`
+- `src/include/planner/expressions/comparison_expression.h`
+- `src/include/planner/expressions/logic_expression.h`
+
+核心接口是：
+
+```cpp
+Field Evaluate(const Row *row) const;
+```
+
+几类表达式的作用：
+
+- `ColumnValueExpression`：从当前行中取出某一列。
+- `ConstantValueExpression`：返回常量值。
+- `ComparisonExpression`：比较左右子表达式，例如 `<`, `=`, `>=`。
+- `LogicExpression`：组合左右布尔结果，例如 `AND`, `OR`。
+
+本项目用 `Field(kTypeInt, 1)` 表示 predicate 为真，用 `Field(kTypeInt, 0)` 表示假。所以执行器判断条件时，一般会写成：
+
+```text
+predicate == nullptr
+或 predicate->Evaluate(row).CompareEquals(Field(kTypeInt, 1)) == kTrue
+```
+
+`predicate == nullptr` 表示没有 `WHERE` 条件，所有行都通过。
+
+#### 2.6 投影 Projection
+
+SQL 可以只选择部分列：
+
+```sql
+select id, name from table-1;
+```
+
+但表中的真实行可能是：
+
+```text
+(id, name, account)
+```
+
+因此顺序扫描时不仅要过滤，还要投影。投影就是从原始行中取出 output schema 需要的列，组成新的 Row。
+
+框架里通常通过 `Column::GetTableInd()` 记录输出列来自原表的第几列。`SeqScanExecutor` 中的 `TupleTransfer` 就是在做这件事：
+
+```text
+source row: (id, name, account)
+output schema: id(table_ind=0), name(table_ind=1)
+result row: (id, name)
+```
+
+这也是为什么 `select *` 和 `select id, name` 返回的 Row 结构不同。
+
+#### 2.7 索引和表必须保持一致
+
+实验五里 `insert / delete / update` 最容易漏掉的点是：表和索引必须同时维护。
+
+插入一条记录：
+
+```text
+TableHeap.InsertTuple(row)
+for each index on table:
+  row.GetKeyFromRow(...)
+  index.InsertEntry(key, row_id)
+```
+
+删除一条记录：
+
+```text
+TableHeap.MarkDelete(row_id)
+for each index on table:
+  old_row.GetKeyFromRow(...)
+  index.RemoveEntry(key, row_id)
+```
+
+更新一条记录：
+
+```text
+old_row -> new_row
+TableHeap.UpdateTuple(new_row, old_row_id)
+for each index on table:
+  RemoveEntry(old_key, old_row_id)
+  InsertEntry(new_key, new_row_id)
+```
+
+如果只改表不改索引，就会出现：
+
+- 表里有数据，但索引查不到。
+- 表里已经删了，但索引还能查到旧 RowId。
+- 更新了索引列后，旧 key 和新 key 同时存在或都不存在。
+
+数据库的一致性在这里非常具体：所有访问路径都必须看到同一份逻辑数据。
+
+### 3. Planner 该怎么理解
+
+Planner 入口在：
+
+- `src/include/planner/planner.h`
+- `src/planner/planner.cpp`
+
+它会根据 AST 类型生成不同计划：
+
+```text
+kNodeSelect -> PlanSelect
+kNodeInsert -> PlanInsert
+kNodeDelete -> PlanDelete
+kNodeUpdate -> PlanUpdate
+```
+
+#### 3.1 PlanSelect
+
+`PlanSelect` 要做几件事：
+
+1. 根据表名从 Catalog 中拿到 `TableInfo`。
+2. 根据 select 列表构造输出 schema。
+3. 根据 where 子句构造 predicate 表达式树。
+4. 判断能否使用索引。
+5. 生成 `SeqScanPlanNode` 或 `IndexScanPlanNode`。
+
+判断是否能用索引时，不要只看有没有索引，还要看条件是否适合索引。例如：
+
+```sql
+where id = 50
+```
+
+很适合使用 `id` 上的索引。
+
+```sql
+where id = 50 and name = 'tom'
+```
+
+如果 `id` 和 `name` 都有索引，可以先分别查到 RowId 集合，再取交集。
+
+```sql
+where id = 50 or name = 'tom'
+```
+
+对初版来说不建议强行用索引，因为 OR 需要做并集，还要小心重复 RowId。当前框架 Planner 对 OR 通常会回退到顺序扫描，这是合理的保守策略。
+
+#### 3.2 PlanInsert
+
+`insert` 的计划通常是两层：
+
+```text
+InsertPlanNode
+  child = ValuesPlanNode
+```
+
+`ValuesPlanNode` 保存 SQL 中写死的值：
+
+```sql
+insert into table-1 values (1001, 'minisql', 0);
+```
+
+执行时：
+
+1. `ValuesExecutor` 先产出这条 Row。
+2. `InsertExecutor` 从 child 拿到 Row。
+3. `InsertExecutor` 把 Row 写入表和索引。
+
+#### 3.3 PlanDelete
+
+`delete` 的计划通常是：
+
+```text
+DeletePlanNode
+  child = SeqScanPlanNode 或 IndexScanPlanNode
+```
+
+例如：
+
+```sql
+delete from table-1 where id = 50;
+```
+
+先由 child 找到要删除的行，再由 `DeleteExecutor` 执行删除。
+
+#### 3.4 PlanUpdate
+
+`update` 的计划类似：
+
+```text
+UpdatePlanNode
+  child = SeqScanPlanNode 或 IndexScanPlanNode
+  update_attrs = 要更新的列和值
+```
+
+例如：
+
+```sql
+update table-1 set name = 'minisql' where id = 500;
+```
+
+执行时：
+
+1. child 找到满足 `id = 500` 的旧行。
+2. `UpdateExecutor` 根据 update attrs 生成新行。
+3. 更新 TableHeap。
+4. 更新相关索引项。
+
+### 4. Executor 逐个讲解
+
+#### 4.1 ExecuteContext
+
+每个执行器都拿着一个 `ExecuteContext`：
+
+```cpp
+ExecuteContext *exec_ctx_;
+```
+
+它保存执行期间需要共享的环境：
+
+- 当前数据库的 `CatalogManager`。
+- 当前事务 `Txn`。
+
+所以执行器不需要自己保存整个 `DBStorageEngine`，只要通过 `exec_ctx_->GetCatalog()` 找表和索引即可。
+
+#### 4.2 AbstractExecutor
+
+所有执行器都继承：
+
+```cpp
+class AbstractExecutor {
+ public:
+  virtual void Init() = 0;
+  virtual bool Next(Row *row, RowId *rid) = 0;
+};
+```
+
+理解这一点非常关键：不管是顺序扫描、索引扫描、插入、删除、更新，都被统一成“初始化 + 产出下一条结果”的接口。
+
+对于查询类执行器，`Next` 真的会返回结果行。
+
+对于修改类执行器，`Next` 更像是“执行一次修改任务”。它可能不需要返回真正的数据行，但仍然用 `true / false` 表示有没有完成一次执行。测试通常只关心修改之后表和索引的状态。
+
+#### 4.3 SeqScanExecutor
+
+顺序扫描执行器负责遍历整张表。
+
+核心成员通常包括：
+
+- `SeqScanPlanNode *plan_`
+- `TableInfo *table_info_`
+- `TableIterator iter_`
+- `TableIterator end_`
+
+`Init()` 应该做：
+
+1. 根据 `plan_->GetTableName()` 或 table id 从 Catalog 获取 `TableInfo`。
+2. 拿到 `TableHeap`。
+3. 设置迭代器起点和终点。
+
+`Next(row, rid)` 应该做：
+
+1. 从当前迭代器开始循环。
+2. 取出原始行 `src_row`。
+3. 判断 predicate：
+   - 如果没有 predicate，通过。
+   - 如果 predicate 为真，通过。
+   - 否则跳过。
+4. 如果通过，把原始行投影成 output schema 需要的行。
+5. 写入输出参数 `row` 和 `rid`。
+6. 迭代器前进。
+7. 返回 `true`。
+8. 如果扫到末尾仍无结果，返回 `false`。
+
+伪代码：
+
+```cpp
+while (iter_ != end_) {
+  Row src = *iter_;
+  ++iter_;
+
+  if (predicate == nullptr || predicate->Evaluate(&src) == true) {
+    Row projected = TupleTransfer(src, output_schema);
+    *row = projected;
+    *rid = src.GetRowId();
+    return true;
+  }
+}
+return false;
+```
+
+注意 `rid` 一定要使用原始表记录的 RowId，而不是投影后新 Row 的默认 RowId。后续 `DeleteExecutor` 和 `UpdateExecutor` 要靠这个 RowId 定位原始记录。
+
+#### 4.4 IndexScanExecutor
+
+索引扫描执行器负责尽量通过 B+ 树找到候选 RowId，然后回表取 Row。
+
+它的难点不是“查一个索引”，而是处理复杂条件：
+
+```sql
+where id = 50 and name = 'tom'
+```
+
+如果两个列都有索引，可以：
+
+```text
+id = 50      -> RowId 集合 A
+name = tom   -> RowId 集合 B
+最终候选集合 = A ∩ B
+```
+
+如果条件中有一部分不能被索引覆盖，例如：
+
+```sql
+where id = 50 and account > 100
+```
+
+而只有 `id` 上有索引，那么可以：
+
+```text
+先用 id 索引找到候选 RowId
+再回表取 Row
+最后用完整 predicate 过滤 account > 100
+```
+
+这就是 `need_filter_` 的含义：
+
+- `need_filter_ = false`：索引条件已经完全表达了 where 条件。
+- `need_filter_ = true`：索引只找到了候选行，还要回表执行完整 predicate。
+
+`Init()` 通常做：
+
+1. 获取表信息。
+2. 获取相关索引信息。
+3. 根据 predicate 和索引查出候选 RowId 集合。
+4. 保存候选 RowId 的迭代状态。
+
+`Next(row, rid)` 通常做：
+
+1. 从候选 RowId 集合取下一个 rid。
+2. 调用 `TableHeap::GetTuple(row, txn)` 或类似接口回表取行。
+3. 如果 `need_filter_`，重新执行 predicate 判断。
+4. 通过后做必要投影，返回 `true`。
+5. 候选集合耗尽后返回 `false`。
+
+这一节建议先让 SeqScan 跑通，再处理 IndexScan。因为索引扫描涉及前面实验三和实验四的正确性，一旦失败，排查范围会更大。
+
+#### 4.5 ValuesExecutor
+
+`ValuesExecutor` 是最简单的执行器之一。它不访问表，也不访问索引，只负责把 `insert values` 中的常量 Row 一条条吐出来。
+
+例如：
+
+```sql
+insert into table-1 values (1001, 'minisql', 0);
+```
+
+对应的 `ValuesPlanNode` 中保存了一组原始值。`ValuesExecutor::Next` 每调用一次返回一条 Row，直到全部返回完。
+
+它的作用是让 InsertExecutor 不关心 SQL 里的值从哪里来。将来如果支持：
+
+```sql
+insert into t2 select * from t1;
+```
+
+那么 InsertExecutor 的 child 就可以不是 ValuesExecutor，而是 SeqScanExecutor。这就是执行计划树的灵活性。
+
+#### 4.6 InsertExecutor
+
+`InsertExecutor` 要做完整插入流程：
+
+1. 初始化 child executor。
+2. 从 child 不断读取待插入 Row。
+3. 检查唯一索引约束。
+4. 插入 TableHeap。
+5. 插入每个索引。
+
+推荐逻辑：
+
+```text
+while child.Next(row, rid):
+  for each index:
+    key = row.GetKeyFromRow(table_schema, index_schema)
+    if unique index and key already exists:
+      插入失败
+
+  table_heap.InsertTuple(row, txn)
+
+  for each index:
+    key = row.GetKeyFromRow(...)
+    index.InsertEntry(key, row.GetRowId(), txn)
+```
+
+为什么先查唯一约束，再插入表？
+
+因为如果先插表，后面发现索引冲突，就要回滚刚插入的表记录；本实验没有完整事务和恢复能力，最好在插入前尽量把错误拦住。
+
+不过要注意：是否“唯一”取决于你前面 Catalog / ExecuteEngine 怎么处理 `UNIQUE` 和 `PRIMARY KEY`。如果你的框架暂时没有完整 unique 元信息，也至少要保证普通索引项能随表插入一起维护。
+
+#### 4.7 DeleteExecutor
+
+`DeleteExecutor` 的 child 会产出要删除的行和 RowId。
+
+核心流程：
+
+```text
+while child.Next(row, rid):
+  table_heap.MarkDelete(rid, txn)
+  for each index:
+    key = row.GetKeyFromRow(table_schema, index_schema)
+    index.RemoveEntry(key, rid, txn)
+```
+
+这里要理解两种删除：
+
+- `MarkDelete`：逻辑删除，先把记录标记为删除。
+- `ApplyDelete`：物理删除，真正回收 slot。
+
+在支持事务的数据库里，删除通常先 `MarkDelete`，等事务提交再 `ApplyDelete`；如果事务回滚，还能撤销删除。当前实验五主要关注单线程、无完整事务的执行路径，测试一般只要求被删记录不能再被扫描或索引查到，所以 `MarkDelete` 通常就足够通过基础测试。
+
+但你要在验收时能说清楚：逻辑删除是为了事务回滚和并发控制预留空间。
+
+#### 4.8 UpdateExecutor
+
+`UpdateExecutor` 比 Delete 更容易出错，因为它同时涉及旧行和新行。
+
+核心流程：
+
+```text
+while child.Next(old_row, old_rid):
+  new_row = GenerateUpdatedTuple(old_row)
+  table_heap.UpdateTuple(new_row, old_rid, txn)
+
+  for each index:
+    old_key = old_row.GetKeyFromRow(...)
+    new_key = new_row.GetKeyFromRow(...)
+    index.RemoveEntry(old_key, old_rid, txn)
+    index.InsertEntry(new_key, new_row.GetRowId(), txn)
+```
+
+有两个特别重要的点：
+
+1. 更新索引时必须先删旧 key，再插新 key。
+2. 插入新索引项时要使用更新后记录的 RowId。
+
+为什么第 2 点重要？因为有些 TableHeap 实现中，如果新 Row 变长导致原页面放不下，`UpdateTuple` 可能会移动记录位置，RowId 会改变。虽然本实验的简单测试多半不会触发这个情况，但严谨实现应该使用更新后的 RowId，而不是盲目沿用 old_rid。
+
+`GenerateUpdatedTuple` 的任务是：
+
+1. 遍历原 Row 每一列。
+2. 如果这一列在 `SET` 子句里，就用新值。
+3. 否则保留旧值。
+4. 组成新的 Row。
+
+例如：
+
+```sql
+update table-1 set name = 'minisql' where id = 500;
+```
+
+原行：
+
+```text
+(500, 'user500', 500.0)
+```
+
+新行：
+
+```text
+(500, 'minisql', 500.0)
+```
+
+### 5. ExecuteEngine 讲解
+
+`ExecuteEngine` 是 MiniSQL 的 SQL 命令总入口。它做两类事：
+
+1. 对 DML：调用 Planner 生成计划，再调用 Executor 执行。
+2. 对 DDL / Utility：直接调用 Catalog 或 DB 管理逻辑。
+
+入口函数通常是：
+
+```cpp
+dberr_t Execute(pSyntaxNode ast, ExecuteContext *context);
+```
+
+#### 5.1 DML 执行路径
+
+对于：
+
+```sql
+select ...
+insert ...
+delete ...
+update ...
+```
+
+推荐理解为：
+
+```text
+Execute
+  -> Planner planner(catalog)
+  -> planner.PlanQuery(ast)
+  -> 得到 PlanNode
+  -> ExecutePlan(plan, result_set, txn, context)
+  -> CreateExecutor(plan)
+  -> executor.Init()
+  -> executor.Next(...)
+```
+
+`CreateExecutor` 中根据 `plan->GetType()` 创建不同执行器：
+
+```text
+SeqScan     -> SeqScanExecutor
+IndexScan   -> IndexScanExecutor
+Insert      -> InsertExecutor
+Values      -> ValuesExecutor
+Delete      -> DeleteExecutor
+Update      -> UpdateExecutor
+```
+
+如果 plan 有 child，也要先递归创建 child executor，再传给父 executor。
+
+#### 5.2 CREATE DATABASE / USE DATABASE
+
+这部分当前代码基本已经提供：
+
+- `ExecuteCreateDatabase`
+- `ExecuteDropDatabase`
+- `ExecuteShowDatabases`
+- `ExecuteUseDatabase`
+
+它们管理的是 `ExecuteEngine` 里的数据库映射：
+
+```cpp
+std::unordered_map<std::string, DBStorageEngine *> dbs_;
+std::string current_db_;
+```
+
+注意：
+
+- 没有 `use database` 前，执行依赖当前数据库的命令应该报错。
+- 创建同名数据库应返回已存在错误。
+- 删除当前数据库时，要小心清理 `current_db_`。
+
+#### 5.3 CREATE TABLE
+
+语法大致是：
+
+```sql
+create table table_name (
+  id int,
+  name char(20) unique,
+  primary key(id)
+);
+```
+
+`ExecuteCreateTable` 要做：
+
+1. 检查当前是否已经选择数据库。
+2. 从 AST 中取表名。
+3. 遍历 column definition list。
+4. 对每个普通列构造 `Column`：
+   - `int` -> `TypeId::kTypeInt`
+   - `float` -> `TypeId::kTypeFloat`
+   - `char(n)` -> `TypeId::kTypeChar`，长度为 n
+5. 记录 `UNIQUE` 列和 `PRIMARY KEY` 列。
+6. 构造 `Schema`。
+7. 调用 `CatalogManager::CreateTable`。
+8. 对 unique / primary key 列，可继续调用 `CatalogManager::CreateIndex` 创建约束索引。
+
+这里的关键数据库知识是：
+
+- `PRIMARY KEY` 本质上要求非空且唯一。
+- `UNIQUE` 要求该列或列组不能有重复值。
+- 在很多数据库中，主键和唯一约束都会通过唯一索引实现。
+
+本项目的基础测试更关注执行器行为，但完整验收时老师可能会输入 SQL 手动测试，所以建议你实现时尽量把 unique 和 primary key 也接到索引创建流程。
+
+#### 5.4 DROP TABLE
+
+`ExecuteDropTable` 比 create table 简单：
+
+1. 检查当前数据库。
+2. 取表名。
+3. 调用 `CatalogManager::DropTable(table_name)`。
+4. 根据返回值打印或返回错误码。
+
+但底层 `DropTable` 要确保删除该表上的索引，否则会留下悬空索引元信息。这个点在实验四里已经讲过。
+
+#### 5.5 SHOW TABLES
+
+`ExecuteShowTables` 一般做：
+
+1. 检查当前数据库。
+2. 调用 `CatalogManager::GetTables`。
+3. 遍历输出表名。
+
+这是一个 utility 命令，不需要 Planner。
+
+#### 5.6 CREATE INDEX
+
+语法大致是：
+
+```sql
+create index index_name on table_name (col1, col2) using bptree;
+```
+
+`ExecuteCreateIndex` 要做：
+
+1. 检查当前数据库。
+2. 从 AST 中取 index name。
+3. 取 table name。
+4. 读取 column list，得到 `vector<string> index_keys`。
+5. 读取可选 index type；如果没有，默认 `"bptree"`。
+6. 调用 `CatalogManager::CreateIndex(table_name, index_name, index_keys, txn, index_info, index_type)`。
+
+注意两点：
+
+1. 当前项目实际只需要 B+ 树索引，所以 index type 可以默认或限制为 `"bptree"`。
+2. 如果表中已有数据，创建索引时应扫描 TableHeap，把已有记录全部插入新索引。这个逻辑适合放在 `CatalogManager::CreateIndex` 中，而不是 ExecuteEngine 中。
+
+#### 5.7 DROP INDEX
+
+语法通常是：
+
+```sql
+drop index index_name;
+```
+
+这个语法里没有表名，所以实现时容易卡住：`CatalogManager::DropIndex` 通常需要 `table_name + index_name`。
+
+解决办法：
+
+1. 调用 `CatalogManager::GetTables` 拿到所有表。
+2. 对每张表调用 `GetTableIndexes(table_name, indexes)`。
+3. 找到名字等于 `index_name` 的索引。
+4. 调用 `DropIndex(table_name, index_name)`。
+
+如果多个表上允许同名索引，严格来说会有歧义。但多数课程 MiniSQL 会要求索引名全库唯一，或者测试只创建不冲突的索引。你可以在实现时检测到多个同名索引就返回错误，避免误删。
+
+#### 5.8 SHOW INDEXES
+
+`ExecuteShowIndexes` 要展示当前数据库中的索引。
+
+推荐做法：
+
+1. 检查当前数据库。
+2. 获取所有表。
+3. 对每张表获取索引列表。
+4. 打印：
+   - table name
+   - index name
+   - index key columns
+
+如果暂时不打印 key columns，至少要能打印表名和索引名，方便手动调试。
+
+#### 5.9 EXECFILE
+
+`execfile` 用来从文件批量执行 SQL：
+
+```sql
+execfile "test.sql";
+```
+
+实现思路：
+
+1. 从 AST 取文件路径。
+2. 打开文件。
+3. 读取内容。
+4. 按分号 `;` 拆成一条条 SQL。
+5. 对每条 SQL 调用 parser 生成 AST。
+6. 递归调用 `Execute`。
+7. 遇到错误时打印具体哪条语句失败。
+
+注意不要简单按行执行，因为 SQL 可以跨多行：
+
+```sql
+create table t (
+  id int,
+  name char(20)
+);
+```
+
+所以更稳的方式是累计文本，遇到分号再作为一条完整 SQL。
+
+#### 5.10 QUIT
+
+`ExecuteQuit` 很简单，返回框架约定的 `DB_QUIT` 即可，让主循环退出。
+
+```sql
+quit;
+```
+
+#### 5.11 Transaction 相关命令
+
+当前实验五通常不要求完整事务，所以：
+
+```sql
+begin;
+commit;
+rollback;
+```
+
+可以先返回 `DB_FAILED` 或打印 “not supported”。后面的实验六、实验七才会逐渐补齐日志恢复和锁管理。
+
+### 6. 实现顺序建议
+
+这一节不要一口气写完整 SQL 引擎，建议按测试驱动拆开：
+
+1. 确认实验一到实验四测试已经通过。
+2. 先读 `test/execution/executor_test.cpp`，理解测试数据如何构造。
+3. 跑通 `SeqScanExecutor`：
+   - 能遍历表。
+   - 能判断 predicate。
+   - 能按 output schema 投影。
+4. 跑通 `ValuesExecutor + InsertExecutor`：
+   - values 能吐出 Row。
+   - insert 能写入 TableHeap。
+   - insert 能维护索引。
+5. 跑通 `DeleteExecutor`：
+   - child 找到目标行。
+   - 表中标记删除。
+   - 索引中删除 key。
+6. 跑通 `UpdateExecutor`：
+   - 生成新 Row。
+   - 更新 TableHeap。
+   - 删除旧索引项，插入新索引项。
+7. 再处理 `IndexScanExecutor`：
+   - 单列等值查找。
+   - 多条件 AND 取交集。
+   - 必要时回表过滤。
+8. 最后补 `ExecuteEngine` 中 DDL / Utility：
+   - create table
+   - drop table
+   - create index
+   - drop index
+   - show indexes
+   - execfile
+   - quit
+
+基础测试命令：
+
+```bash
+make executor_test -j
+./test/executor_test
+```
+
+如果你要手动跑交互式 MiniSQL，一般是构建主程序后执行：
+
+```bash
+./bin/minisql
+```
+
+具体可执行文件路径以项目 CMake 输出为准。
+
+### 7. 测试怎么理解
+
+#### 7.1 SimpleSeqScanTest
+
+测试会创建一张 `table-1`，插入 1000 行左右的数据，然后执行类似：
+
+```sql
+select id, name from table-1 where id < 500;
+```
+
+期望返回 500 行。
+
+如果失败，优先检查：
+
+1. `SeqScanExecutor::Init` 有没有正确拿到表。
+2. 迭代器有没有从 `Begin()` 到 `End()`。
+3. predicate 是否把 `id < 500` 正确判断为 true。
+4. 投影后是不是只返回 `id, name`。
+5. `Next` 是否每次只返回一行，而不是一次返回全部。
+
+#### 7.2 SimpleRawInsertTest
+
+测试会插入一条新记录，然后再扫描验证。
+
+如果失败，优先检查：
+
+1. `ValuesExecutor` 是否真的产出了 Row。
+2. `InsertExecutor` 是否调用 `TableHeap::InsertTuple`。
+3. 插入成功后 RowId 是否写回 Row。
+4. 插入后是否更新所有索引。
+
+#### 7.3 SimpleDeleteTest
+
+测试会在 `id` 上建索引，先通过索引扫描找到 `id = 50`，然后删除，再次扫描应找不到。
+
+如果删除后还能通过索引查到，说明：
+
+```text
+DeleteExecutor 删除了表记录，但没有 RemoveEntry
+```
+
+如果顺序扫描还能查到，说明：
+
+```text
+TableHeap::MarkDelete 或 TableIterator 对 deleted 标记处理有问题
+```
+
+这时候要回头看实验二的 TablePage / TableIterator 实现。
+
+#### 7.4 SimpleUpdateTest
+
+测试会更新一条记录的 `name` 字段，再扫描确认变成 `"minisql"`。
+
+如果失败，优先检查：
+
+1. child executor 是否正确找到 `id = 500`。
+2. `GenerateUpdatedTuple` 是否只改了指定列。
+3. `UpdateTuple` 是否成功。
+4. 新 Row 的 RowId 是否正确。
+5. 如果更新索引列，索引是否同步更新。
+
+### 8. 常见错误清单
+
+1. `predicate == nullptr` 时错误地返回 false，导致无 where 查询没有结果。
+2. predicate 的 true 值比较方式写错，没有按 `Field(kTypeInt, 1)` 判断。
+3. 顺序扫描忘记投影，`select id, name` 返回了整行。
+4. 投影时没有用 `Column::GetTableInd()`，导致列顺序错乱。
+5. `SeqScanExecutor::Next` 返回的 `rid` 是投影行的默认 RowId，而不是原表 RowId。
+6. `IndexScanExecutor` 查到 RowId 后没有回表取完整 Row。
+7. 多个索引条件用 AND 时没有取交集，导致结果过多。
+8. 用索引处理 OR 但没做去重或并集，导致结果错误；初版建议 OR 回退到 SeqScan。
+9. `need_filter_ = true` 时没有执行完整 predicate，导致候选行没有二次过滤。
+10. Insert 只插入 TableHeap，没有插入索引。
+11. Insert 没有先检查唯一索引冲突。
+12. Delete 只标记删除表记录，没有删除索引项。
+13. Update 只更新表，没有更新索引。
+14. Update 插入新索引项时仍使用旧 RowId。
+15. DDL 命令错误地走 Planner，导致 create/drop/show 无法执行。
+16. `ExecuteCreateTable` 没处理 `char(n)` 的长度。
+17. `ExecuteCreateTable` 没处理 primary key / unique，手动验收时约束失效。
+18. `DROP INDEX` 语法没有表名，实现时却直接要求 table name。
+19. `execfile` 按行执行 SQL，遇到多行 create table 失败。
+20. 未选择当前数据库时仍执行表或索引操作，导致空指针或错误数据库被修改。
+
+### 9. 验收问答准备
+
+问题：Planner 和 Executor 的区别是什么？
+
+回答要点：Planner 根据 SQL 语法树和 Catalog 元信息生成执行计划，例如顺序扫描、索引扫描、插入、删除、更新；Executor 根据计划真正访问 TableHeap 和 Index，一行一行产出结果或修改数据。
+
+问题：什么是 Volcano 模型？
+
+回答要点：每个执行器提供 `Init` 和 `Next` 接口。`Init` 初始化状态，`Next` 每次返回下一行结果。父执行器可以把子执行器当作数据源，不关心它底层是扫描表、扫描索引还是常量 values。
+
+问题：为什么 `create table` 不需要 Planner？
+
+回答要点：`create table` 是 DDL，不需要扫描或修改已有行。它主要是在 Catalog 中创建表元信息和 TableHeap，因此可以由 `ExecuteEngine` 直接处理。
+
+问题：SeqScan 和 IndexScan 有什么区别？
+
+回答要点：SeqScan 遍历整张表，对每行判断 predicate；IndexScan 先通过索引找到候选 RowId，再回表取记录，通常适合等值查询或能用索引缩小范围的查询。
+
+问题：`need_filter_` 是什么？
+
+回答要点：表示索引条件是否已经完全覆盖 where 条件。如果索引只能找到候选 RowId，还需要回表后再执行完整 predicate 过滤，这时 `need_filter_` 为 true。
+
+问题：为什么 Insert/Delete/Update 都要维护索引？
+
+回答要点：索引是表数据的访问路径。表数据变化后，如果索引不同步变化，就会出现索引查到不存在的记录、查不到新记录、或查询结果和顺序扫描不一致的问题。
+
+问题：ValuesExecutor 有什么用？
+
+回答要点：它把 `insert values (...)` 中的常量行作为一个执行器输出，让 InsertExecutor 只依赖 child executor 取行。这样执行计划结构更统一，将来可以扩展到 `insert into ... select ...`。
+
+问题：Update 为什么要先删旧索引项再插新索引项？
+
+回答要点：更新可能改变索引列的值。旧 key 不删除会留下脏索引项，新 key 不插入则索引查不到更新后的记录。
+
+问题：`DROP INDEX` 没有表名时怎么办？
+
+回答要点：可以遍历 Catalog 中所有表及其索引，找到名字匹配的索引后调用 `DropIndex(table_name, index_name)`。如果允许不同表有同名索引，需要额外处理歧义。
+
+问题：`execfile` 为什么不能简单按行执行？
+
+回答要点：SQL 语句可能跨多行，例如 `create table` 的列定义。应累计文本直到分号，再作为一条完整 SQL 解析执行。
+
+### 10. 本实验完成标准
+
+当你完成实验五后，应能做到：
+
+1. `executor_test` 通过。
+2. `select` 能通过顺序扫描或索引扫描返回正确结果。
+3. `insert` 能写入表并维护索引。
+4. `delete` 能删除表记录并移除索引项。
+5. `update` 能生成新记录并同步索引。
+6. `create/drop table` 能正确调用 Catalog。
+7. `create/drop/show index` 能正确调用 Catalog。
+8. `execfile` 能批量执行 SQL 文件。
+9. `quit` 能正常退出主循环。
+
+到这里，MiniSQL 已经从“几个底层模块”变成了一个可以执行基础 SQL 的小型数据库。后面的 Recovery Manager 会继续解决一个更真实的问题：如果数据库执行到一半崩溃，如何根据日志恢复到一致状态。

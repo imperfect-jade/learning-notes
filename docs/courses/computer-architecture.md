@@ -3,7 +3,7 @@ course: 计算机体系结构
 textbook: 计算机体系结构：量化研究方法（第六版）
 style: exam-review
 source_policy: references-section
-last_updated: 2026-05-26
+last_updated: 2026-05-28
 -->
 
 # 计算机体系结构
@@ -485,32 +485,236 @@ Memory Controller
   commit in program order
 ```
 
-### 5.3 Scoreboard
+### 5.3 Scoreboard 计分板算法
 
-Scoreboard 是集中式动态调度机制，负责跟踪功能部件和寄存器状态。
+Scoreboard 是 CDC 6600 中提出的集中式动态调度机制。它像一张全局状态表，统一记录“哪些功能部件忙、哪些寄存器将被谁写、哪些操作数已经可读”，然后决定每条指令什么时候可以进入下一阶段。
 
-典型阶段：
+核心目标：
+
+- 在不破坏程序语义的前提下，让独立指令尽早执行。
+- 允许乱序执行（out-of-order execution）和乱序完成（out-of-order completion）。
+- 发射通常仍按程序顺序进行（in-order issue），这样便于检查 WAW 和结构冲突。
+- 不使用寄存器重命名时，RAW、WAR、WAW 都必须显式处理。
+
+计分板把简单流水线的 ID 阶段拆成两个阶段：
 
 ```text
-Issue -> Read Operands -> Execute -> Write Result
+IF -> Issue(IS) -> Read Operands(RO) -> Execute(EX) -> Write Result(WB)
 ```
 
-| 阶段 | 检查内容 |
+| 阶段 | 核心问题 | 处理的冒险 |
+| --- | --- | --- |
+| Issue | 功能部件是否空闲？目的寄存器是否已有未完成写入？ | 结构冒险、WAW |
+| Read Operands | 源操作数是否都已经由更老指令写好？ | RAW |
+| Execute | 功能部件执行运算，结束后通知计分板 | 执行延迟 |
+| Write Result | 写回会不会破坏更老指令尚未读取的源寄存器？ | WAR |
+
+!!! note "计分板的直觉"
+    Tomasulo 把依赖跟踪分散到保留站和标签里；Scoreboard 则把依赖跟踪集中放在一张全局表中。它更像“交通指挥中心”，每一步都要先问全局状态是否允许。
+
+### 5.4 Scoreboard 的三张状态表
+
+#### 5.4.1 Instruction Status
+
+记录每条正在执行的指令处于哪个阶段：
+
+| 指令 | Issue | Read Operands | Execute Complete | Write Result |
+| --- | --- | --- | --- | --- |
+| `LD F6, 34(R2)` | 1 | 2 | 4 | 5 |
+| `MULTD F0, F2, F4` | 2 | 6 | 16 | 17 |
+
+考试中这张表常用于填写每条指令在哪个 cycle 进入 IS/RO/EX/WB。
+
+#### 5.4.2 Functional Unit Status
+
+记录每个功能部件的占用和依赖情况：
+
+| 字段 | 含义 |
 | --- | --- |
-| Issue | 功能部件是否空闲，是否有 WAW |
-| Read Operands | 源操作数是否可读，处理 RAW |
-| Execute | 功能部件执行 |
-| Write Result | 写回前检查 WAR |
+| `Busy` | 功能部件是否正在被某条指令使用 |
+| `Op` | 当前执行的操作，如 `Add`, `Mult`, `Divide` |
+| `Fi` | 目的寄存器 |
+| `Fj`, `Fk` | 两个源寄存器 |
+| `Qj`, `Qk` | 将产生 `Fj/Fk` 的功能部件；为空表示源值已可用 |
+| `Rj`, `Rk` | 源操作数是否已经准备好并可读取 |
 
-**优点**：能让部分无关指令越过停顿点执行。
+可把它理解成：
 
-**局限**：
+```text
+Fi: 我将来要写谁
+Fj/Fk: 我要读谁
+Qj/Qk: 我等谁给我数据
+Rj/Rk: 我现在能不能读
+```
 
-- 集中控制复杂。
-- WAR 和 WAW 会限制并行。
-- 没有寄存器重命名时，名字相关仍然显著。
+#### 5.4.3 Register Result Status
 
-### 5.4 Tomasulo 算法
+记录每个寄存器的未来写入者：
+
+| 寄存器 | 将由哪个功能部件写 |
+| --- | --- |
+| `F0` | `Mult1` |
+| `F6` | `Integer` |
+| `F8` | 空，表示没有未完成写入 |
+
+这张表用于：
+
+- Issue 阶段检查 WAW：若目的寄存器已有写入者，则不能发射。
+- Read Operands 阶段判断 RAW：若源寄存器仍有未完成写入者，则要等待。
+- Write Result 后清空对应目的寄存器状态。
+
+### 5.5 Scoreboard 四阶段详细规则
+
+设当前指令为：
+
+```text
+OP Fi, Fj, Fk
+```
+
+其中 `Fi` 是目的寄存器，`Fj/Fk` 是源寄存器。
+
+#### 5.5.1 Issue：检查结构冒险与 WAW
+
+发射条件：
+
+```text
+functional unit for OP is free
+and RegisterResult[Fi] is empty
+```
+
+若条件满足，计分板更新：
+
+```text
+Busy[FU] = true
+Op[FU] = OP
+Fi[FU] = Fi
+Fj[FU] = Fj
+Fk[FU] = Fk
+Qj[FU] = RegisterResult[Fj]
+Qk[FU] = RegisterResult[Fk]
+Rj[FU] = (Qj[FU] is empty)
+Rk[FU] = (Qk[FU] is empty)
+RegisterResult[Fi] = FU
+```
+
+若功能部件忙，发生结构冒险；若 `RegisterResult[Fi]` 非空，说明更早指令也要写 `Fi`，发生 WAW 风险。
+
+#### 5.5.2 Read Operands：检查 RAW
+
+读取条件：
+
+```text
+Rj[FU] == true
+and Rk[FU] == true
+```
+
+读完后：
+
+```text
+Rj[FU] = false
+Rk[FU] = false
+```
+
+这里把 `Rj/Rk` 清零的含义是：该指令已经把源操作数读入功能部件内部，不再需要从寄存器堆读取这些源寄存器。因此后续写回这些寄存器不会再对它造成 WAR 危险。
+
+RAW 例子：
+
+```asm
+ADDD  F2, F0, F4
+MULTD F6, F2, F8
+```
+
+`MULTD` 的 `F2` 来自前一条 `ADDD`，所以在 `ADDD` 写回前，`MULTD` 的 `Qj` 指向 `Adder`，`Rj=false`，不能进入 RO。
+
+#### 5.5.3 Execute：功能部件执行
+
+一旦 RO 完成，功能部件开始执行。不同功能部件可有不同延迟：
+
+| 功能部件 | 典型延迟 | 说明 |
+| --- | ---: | --- |
+| Integer | 1 | 地址计算、整数加减 |
+| FP Add | 多周期 | 浮点加减 |
+| FP Mult | 多周期 | 浮点乘法 |
+| FP Divide | 更长 | 浮点除法常是瓶颈 |
+
+执行完成后，功能部件先通知计分板“结果已准备好”，但不一定能立刻写回，因为 WB 阶段还要检查 WAR。
+
+#### 5.5.4 Write Result：检查 WAR
+
+写回条件：没有任何更早但尚未读取操作数的指令还需要读当前目的寄存器。
+
+形式化地说，对所有功能部件 `f`，不能存在：
+
+```text
+Fj[f] == Fi[current] and Rj[f] == true
+or
+Fk[f] == Fi[current] and Rk[f] == true
+```
+
+如果存在，当前指令必须推迟写回，否则会覆盖更早指令还没读走的源值，造成 WAR。
+
+WAR 例子：
+
+```asm
+DIVD  F0, F2, F4   # 更早指令，需要读 F2
+ADDD  F2, F6, F8   # 更晚指令，要写 F2
+```
+
+若 `ADDD` 先完成，但 `DIVD` 还没读 `F2`，则 `ADDD` 不能写回 `F2`，必须等 `DIVD` 完成 RO。
+
+### 5.6 Scoreboard 例题：逐步判断停顿原因
+
+考虑指令序列：
+
+```asm
+I1: LD    F6, 34(R2)
+I2: LD    F2, 45(R3)
+I3: MULTD F0, F2, F4
+I4: SUBD  F8, F6, F2
+I5: DIVD  F10, F0, F6
+I6: ADDD  F6, F8, F2
+```
+
+逐条看依赖：
+
+| 指令 | 依赖关系 | 说明 |
+| --- | --- | --- |
+| `I3` 读 `F2` | RAW on `I2 -> I3` | `I3` 要等 `I2` 的 load 结果 |
+| `I4` 读 `F6/F2` | RAW on `I1/I2 -> I4` | 两个 load 都要先产生结果 |
+| `I5` 读 `F0/F6` | RAW on `I3/I1 -> I5` | 乘法结果通常较晚 |
+| `I6` 写 `F6` | WAW with `I1`? | 若 `I1` 未完成，不能发射 |
+| `I6` 写 `F6` | WAR with `I5`? | 若 `I5` 尚未读 `F6`，`I6` 不能写回 |
+
+分析步骤：
+
+1. Issue 阶段先看功能部件和目的寄存器。`I6` 若要写 `F6`，但较早的 `I1` 仍登记为 `F6` 的写入者，就发生 WAW，不能发射。
+2. RO 阶段只要有源寄存器由未完成指令产生，就等 RAW。例如 `I5` 要等 `I3` 写出 `F0`。
+3. EX 阶段只受功能部件延迟影响。
+4. WB 阶段必须检查是否有更早指令还没读当前目的寄存器。例如 `I6` 写 `F6` 前，要确认更早的 `I5` 已经读过 `F6`。
+
+!!! tip "做表格题的方法"
+    不要只凭“谁先完成”判断。计分板题必须分阶段看：Issue 管结构/WAW，Read Operands 管 RAW，Write Result 管 WAR。每个停顿都要说清楚卡在哪一阶段。
+
+### 5.7 Scoreboard 的能力边界
+
+Scoreboard 的性能受以下因素限制：
+
+| 限制 | 影响 |
+| --- | --- |
+| 程序本身 ILP 不足 | 找不到独立指令时，动态调度也无能为力 |
+| 窗口大小有限 | 只能在已发射/可观察范围内寻找独立指令 |
+| 功能部件数量和延迟 | 功能部件少或延迟长会造成结构停顿 |
+| WAR/WAW 名字相关 | 没有重命名时会限制乱序写回和发射 |
+| 分支边界 | 不做推测时通常难以跨越未解析分支 |
+| 集中式控制 | 全局比较和状态维护随规模增大变复杂 |
+
+总结：
+
+- Scoreboard 能动态解决 RAW，因为它可以等真正生产者完成后再读操作数。
+- Scoreboard 不能自然消除 WAR/WAW，因为寄存器名仍然复用。
+- 若加入显式寄存器重命名，WAR/WAW 可以消除，但这已经接近现代乱序核心的思路。
+
+### 5.8 Tomasulo 算法
 
 Tomasulo 用保留站（Reservation Station）和公共数据总线（CDB）实现分布式调度与隐式寄存器重命名。
 
@@ -538,7 +742,7 @@ Instruction Queue
 | Qj, Qk | 将产生源操作数的保留站标签 |
 | Busy | 该保留站是否占用 |
 
-### 5.5 Tomasulo 三阶段
+### 5.9 Tomasulo 三阶段
 
 | 阶段 | 行为 |
 | --- | --- |
@@ -553,7 +757,34 @@ Instruction Queue
 - RAW 通过等待标签广播解决。
 - 多个等待同一结果的指令可在 CDB 广播后同时就绪。
 
-### 5.6 Scoreboard 与 Tomasulo 对比
+### 5.10 Tomasulo 细节：标签、广播与重命名
+
+Tomasulo 中，寄存器名会被替换为“值”或“标签”：
+
+```text
+若源寄存器当前已有值:
+    Vj/Vk = value
+    Qj/Qk = empty
+若源寄存器将由某个保留站产生:
+    Qj/Qk = producer tag
+    Vj/Vk = empty
+```
+
+CDB 广播时：
+
+```text
+producer tag + result value
+```
+
+所有等待该 tag 的保留站同时捕获值，并把对应 `Qj/Qk` 清空。寄存器结果状态表若仍指向该 tag，也会更新寄存器值。
+
+Tomasulo 消除 WAR/WAW 的原因：
+
+- 每次写寄存器时，寄存器状态表指向最新生产者 tag。
+- 更老指令若已经在保留站中保存了旧值或旧 tag，就不再依赖寄存器名本身。
+- 更晚指令写同一个架构寄存器，只是改变“未来最新值”的 tag，不会覆盖更早指令所需的旧值。
+
+### 5.11 Scoreboard 与 Tomasulo 对比
 
 | 维度 | Scoreboard | Tomasulo |
 | --- | --- | --- |
@@ -563,8 +794,9 @@ Instruction Queue
 | WAR/WAW | 可能导致停顿 | 通常被重命名消除 |
 | 转发 | 受限 | CDB 广播 |
 | 硬件复杂度 | 集中表复杂 | CDB/保留站复杂 |
+| 精确异常 | 原始形式较弱 | 原始形式也不完美，常配 ROB |
 
-### 5.7 显式寄存器重命名
+### 5.12 显式寄存器重命名
 
 现代处理器常使用比 ISA 寄存器更多的物理寄存器。
 
@@ -583,6 +815,38 @@ Physical register P37
 - 提交后释放旧物理寄存器。
 
 **重点**：寄存器重命名只是解决名字冲突，不改变真实数据依赖。
+
+### 5.13 显式重命名版 Scoreboard
+
+PPT 中还给出一种重要扩展：Scoreboard 可以和显式寄存器重命名结合。此时使用比 ISA 寄存器更多的物理寄存器：
+
+```text
+Architectural register F2
+       |
+Rename Table
+       v
+Physical register P38
+```
+
+Issue 阶段变化：
+
+1. 若指令写寄存器，为目的寄存器分配一个新的物理寄存器。
+2. Rename Table 把架构寄存器映射到新物理寄存器。
+3. 源操作数按当前 Rename Table 读取对应物理寄存器编号。
+4. 若没有空闲物理寄存器，则 Issue 停顿。
+5. 功能部件结构冲突仍然需要检查。
+
+与原始 Scoreboard 的区别：
+
+| 项 | 原始 Scoreboard | 显式重命名版 Scoreboard |
+| --- | --- | --- |
+| WAW | Issue 阶段可能停顿 | 不同写入分配不同物理寄存器，消除 |
+| WAR | WB 阶段可能停顿 | 更早读旧物理寄存器，更晚写新物理寄存器，消除 |
+| RAW | 仍需等待真实生产者 | 仍需等待真实生产者 |
+| 新瓶颈 | WAR/WAW、功能部件 | 空闲物理寄存器、功能部件、提交/释放策略 |
+
+!!! warning "重命名的易错点"
+    重命名不是“提前算出结果”，也不是消除所有依赖。它只把复用同一寄存器名造成的假依赖拆开；真正的数据流 RAW 仍然必须等待生产者结果。
 
 ## 六、分支预测与推测执行
 
@@ -1149,7 +1413,27 @@ print(x);
 4. 对 load-use、结构冲突和分支错误插入 stall/flush。
 5. 计算总周期数、CPI 或 IPC。
 
-### 11.4 Tomasulo/ROB 题
+### 11.4 Scoreboard 题
+
+步骤：
+
+1. 写出指令序列的源寄存器和目的寄存器。
+2. 建立三张表：Instruction Status、Functional Unit Status、Register Result Status。
+3. Issue 阶段先检查功能部件是否空闲，再检查目的寄存器是否已有未完成写入。
+4. Read Operands 阶段检查源寄存器是否还有未完成生产者。
+5. Execute 阶段按功能部件延迟推进。
+6. Write Result 阶段检查是否会覆盖更早指令尚未读取的源寄存器。
+7. 每个 stall 都标明原因：结构冒险、RAW、WAR 或 WAW。
+
+判断口诀：
+
+```text
+Issue 看 结构 + WAW
+RO    看 RAW
+WB    看 WAR
+```
+
+### 11.5 Tomasulo/ROB 题
 
 步骤：
 
@@ -1157,10 +1441,11 @@ print(x);
 2. 发射时分配保留站/ROB 项。
 3. 若源操作数未就绪，记录生产者标签。
 4. 执行完成后通过 CDB 广播。
-5. ROB 头部就绪后按序提交。
-6. 遇到分支错误或异常时 flush younger instructions。
+5. 等待该标签的保留站捕获结果，并清空对应 `Qj/Qk`。
+6. ROB 头部就绪后按序提交。
+7. 遇到分支错误或异常时 flush younger instructions。
 
-### 11.5 分支预测题
+### 11.6 分支预测题
 
 步骤：
 
@@ -1170,7 +1455,7 @@ print(x);
 4. 对 2-bit 饱和计数器注意上下界。
 5. 对 global/local predictor 注意使用哪段历史索引。
 
-### 11.6 并行体系结构题
+### 11.7 并行体系结构题
 
 步骤：
 
@@ -1190,6 +1475,10 @@ print(x);
 | 流水线 | 让每条指令延迟降低 | 主要提高吞吐率 |
 | RAW | 可用重命名消除 | RAW 是真实数据依赖，只能等待或转发 |
 | WAR/WAW | 一定是真依赖 | 是名字相关，可用重命名消除 |
+| Scoreboard Issue | 只检查功能部件 | 还必须检查目的寄存器是否有未完成写入，避免 WAW |
+| Scoreboard RO | 只要发射就能读操作数 | 必须等源操作数没有未完成生产者，避免 RAW |
+| Scoreboard WB | 执行完就能写回 | 写回前要确认不会覆盖更早指令尚未读取的源寄存器，避免 WAR |
+| 计分板与重命名 | 计分板天然消除名字相关 | 原始计分板不消除 WAR/WAW，显式重命名后才可消除 |
 | Tomasulo | 只是一种转发机制 | 核心是保留站、标签、CDB 和隐式重命名 |
 | ROB | 用于加快执行 | 主要用于按序提交和精确异常 |
 | 分支预测 | 只需预测方向 | taken 时还需要目标地址 |
@@ -1224,6 +1513,7 @@ print(x);
 | Pipeline | 提高指令吞吐 | 冒险、分支代价、流水寄存器开销 |
 | Forwarding | 减少 RAW 停顿 | 旁路网络复杂 |
 | Scoreboard | 动态调度 | WAR/WAW 限制、集中控制 |
+| Scoreboard + Renaming | 消除名字相关 | 物理寄存器和释放策略复杂 |
 | Tomasulo | 乱序执行和重命名 | CDB、保留站复杂 |
 | ROB | 精确异常和按序提交 | 容量限制、提交带宽 |
 | 2-bit Predictor | 降低简单循环分支错误 | 表项冲突 |
@@ -1273,14 +1563,14 @@ for (int i = 0; i < n; i++) {
 ## 十五、参考资料
 
 - John L. Hennessy, David A. Patterson.《计算机体系结构：量化研究方法（第六版）》。
-- WintermelonC Docs：[计算机体系结构](https://wintermelonc.github.io/WintermelonC_Docs/zju/compulsory_courses/computer_architecture/)，用于参考课程章节结构与理论/实验资料入口。
+- WintermelonC Docs：[计算机体系结构](https://wintermelonc.github.io/WintermelonC_Docs/zju/compulsory_courses/computer_architecture/)（访问日期：2026-05-28），用于参考课程章节结构与理论/实验资料入口。
 - PPT：`Arch_2_ch1_1_fundamentals1.pptx`，第 1-64 页，体系结构基础、性能、功耗、分类与设计目标。
 - PPT：`Arch_3_ch1_2_fundamentals2.pptx`，第 1-74 页，成本、可靠性、可用性、benchmark 与性能报告。
 - PPT：`Arch_4_pipeline.pptx`，第 1-106 页，流水线、冒险、停顿和基础流水线性能。
 - PPT：`Arch_5_ch2_1_cache_basics.pptx`，第 1-38 页，Cache 基本概念、映射、替换和写策略。
 - PPT：`Arch_6_ch2_2_cache_miss.pptx`，第 1-71 页，降低 miss penalty、miss rate、hit time 与并行访存。
 - PPT：`Arch_7_ch2_3_memory_technology.pptx`，第 1-28 页，主存技术、组织方式和带宽优化。
-- PPT：`Arch_8_ch3_1_dynamic_scheduling.pptx`，第 1-158 页，ILP、Scoreboard、Tomasulo、寄存器重命名。
+- PPT：`Arch_8_ch3_1_dynamic_scheduling.pptx`，第 1-158 页，ILP、Scoreboard、Tomasulo、寄存器重命名；其中第 29-65 页重点用于补充计分板四阶段、状态表和停顿条件。
 - PPT：`Arch_9_ch3_2_branch_predictor.pptx`，第 1-56 页，动态分支预测、相关预测、锦标赛预测、BTB 和返回地址预测。
 - PPT：`Arch_10_ch3_3_speculation.pptx`，第 1-42 页，推测执行、ROB、按序提交和 memory disambiguation。
 - PPT：`Arch_11_ch3_4_superscalar_VLIW.pptx`，第 1-47 页，多发射、超标量、VLIW、循环展开和编译器调度。
