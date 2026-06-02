@@ -67,10 +67,19 @@
 | 已讲解 | 5.2 火山模型与执行计划 | 见“实验五” |
 | 已讲解 | 5.3 SeqScan / IndexScan / Insert / Update / Delete | 见“实验五” |
 | 已讲解 | 5.4 ExecuteEngine 与 SQL 命令 | 见“实验五” |
+| 已讲解 | 6.1 Recovery Manager 概览 | 见“实验六” |
+| 已讲解 | 6.2 LogRec 与 LSN / prev_lsn | 见“实验六” |
+| 已讲解 | 6.3 Checkpoint 与 Redo Phase | 见“实验六” |
+| 已讲解 | 6.4 Undo Phase 与测试推导 | 见“实验六” |
+| 已讲解 | 7.1 Lock Manager 概览 | 见“实验七” |
+| 已讲解 | 7.2 共享锁、排他锁与 2PL | 见“实验七” |
+| 已讲解 | 7.3 锁升级、等待队列与事务状态 | 见“实验七” |
+| 已讲解 | 7.4 等待图与死锁检测 | 见“实验七” |
+| 已追加 | 附录：测试代码设计指导 | 见“测试代码设计指导” |
 
 ## 下一步
 
-建议按实验顺序推进。当前讲解已经覆盖实验一到实验五，下一节将进入 `Recovery Manager`，重点是日志结构、Redo、Undo 和崩溃恢复。
+建议按实验顺序推进。当前讲解已经覆盖实验一到实验七。后续可以按 `MiniSQL.md` 的模块顺序逐个实现源码、运行单测，并把失败用例反向定位到对应章节复习。
 
 ## 实验一：Disk and Buffer Pool Manager
 
@@ -5054,3 +5063,2822 @@ TableHeap::MarkDelete 或 TableIterator 对 deleted 标记处理有问题
 9. `quit` 能正常退出主循环。
 
 到这里，MiniSQL 已经从“几个底层模块”变成了一个可以执行基础 SQL 的小型数据库。后面的 Recovery Manager 会继续解决一个更真实的问题：如果数据库执行到一半崩溃，如何根据日志恢复到一致状态。
+
+## 实验六：Recovery Manager
+
+### 1. 实验目标
+
+实验六要解决的问题是：数据库运行时可能会崩溃，崩溃发生时，内存里的修改可能已经写了一部分到磁盘，也可能日志只写了一部分。恢复管理器要根据日志判断：
+
+1. 哪些已经提交的修改必须保留下来。
+2. 哪些未提交或中止事务的修改必须撤销。
+3. 从检查点开始，如何减少恢复时要扫描的日志量。
+
+本项目中的实验六是一个简化版恢复系统。它没有直接恢复真实 `TableHeap` 和磁盘页，而是用一个内存键值表模拟数据库：
+
+```cpp
+using KeyType = std::string;
+using ValType = int32_t;
+using KvDatabase = std::unordered_map<KeyType, ValType>;
+```
+
+你可以把它理解成：
+
+```text
+真实数据库中：
+  key = RowId 或页面中的某条记录
+  value = 记录内容
+
+实验测试中：
+  key = "A" / "B" / "C" / "D"
+  value = 2000 / 2050 / 600 ...
+```
+
+对应文件：
+
+- `src/include/recovery/log_rec.h`
+- `src/include/recovery/recovery_manager.h`
+- `src/include/recovery/log_manager.h`
+- `test/recovery/recovery_manager_test.cpp`
+- `src/include/common/config.h`
+- `src/include/concurrency/txn.h`
+- `src/include/concurrency/txn_manager.h`
+
+对应测试：
+
+```bash
+make recovery_manager_test -j
+./test/recovery_manager_test
+```
+
+这一节要补齐的核心内容：
+
+1. `LogRec` 应保存事务 id、日志类型、LSN、上一条日志 LSN，以及插入/删除/更新所需的 key/value。
+2. `CreateInsertLog / CreateDeleteLog / CreateUpdateLog / CreateBeginLog / CreateCommitLog / CreateAbortLog` 要正确生成日志。
+3. `RecoveryManager::Init` 要从检查点恢复初始状态。
+4. `RecoveryManager::RedoPhase` 要重做历史，并处理已经 abort 的事务。
+5. `RecoveryManager::UndoPhase` 要撤销崩溃时仍未完成的事务。
+
+### 2. 相关数据库知识
+
+#### 2.1 为什么数据库需要恢复
+
+假设事务 T1 执行：
+
+```sql
+update account set balance = balance - 100 where id = 1;
+update account set balance = balance + 100 where id = 2;
+commit;
+```
+
+如果数据库在两条 update 中间崩溃，就会出现钱从账户 1 扣了，但没加到账户 2 的情况。这就是恢复系统要避免的状态。
+
+数据库恢复要维护两个核心性质：
+
+- 原子性：一个事务的修改要么全部生效，要么全部不生效。
+- 持久性：事务提交后，即使系统崩溃，修改也不能丢。
+
+恢复系统的主要工具就是日志。
+
+#### 2.2 什么是 WAL
+
+WAL 是 Write-Ahead Logging，预写日志。
+
+它的核心规则是：
+
+```text
+数据页写入磁盘之前，描述该修改的日志必须先写入磁盘。
+```
+
+为什么？因为如果数据页先写了，日志没写，崩溃后数据库就不知道这个数据页为什么变了，也无法判断它该保留还是撤销。
+
+在真实数据库中，每次修改表记录时会先生成日志，例如：
+
+```text
+<T0, update row R, old_value, new_value>
+```
+
+然后数据页可以晚一点再刷盘。崩溃恢复时，根据日志决定重做或撤销。
+
+本实验中的 `LogManager` 目前只是空壳：
+
+```cpp
+class LogManager {};
+```
+
+说明课程当前重点不是实现后台刷日志线程，而是先掌握恢复算法本身。
+
+#### 2.3 什么是 LSN
+
+LSN 是 Log Sequence Number，日志序列号。可以理解为每条日志在日志流中的位置。
+
+本实验中：
+
+```cpp
+using lsn_t = int32_t;
+static lsn_t LogRec::next_lsn_ = 0;
+```
+
+每创建一条日志，就分配一个递增 LSN：
+
+```text
+第 1 条日志 lsn = 0
+第 2 条日志 lsn = 1
+第 3 条日志 lsn = 2
+...
+```
+
+LSN 的作用：
+
+1. 确定日志顺序。
+2. 恢复时从某个位置开始扫描。
+3. 配合 `prev_lsn_` 找到某个事务自己的日志链。
+
+#### 2.4 什么是 prev_lsn
+
+全局日志顺序是一条大链：
+
+```text
+LSN 0, LSN 1, LSN 2, LSN 3, ...
+```
+
+但 Undo 时，我们常常只想倒着找“某个事务自己的日志”。这就需要 `prev_lsn_`。
+
+例如事务 T0 的日志是：
+
+```text
+LSN 0: <T0 Begin>
+LSN 1: <T0 Update A 2000 -> 2050>
+LSN 2: <T0 Delete B 1000>
+LSN 6: <T0 Update C 600 -> 700>
+LSN 7: <T0 Abort>
+```
+
+那么每条日志的 `prev_lsn_` 应该是：
+
+```text
+LSN 0.prev = INVALID_LSN
+LSN 1.prev = 0
+LSN 2.prev = 1
+LSN 6.prev = 2
+LSN 7.prev = 6
+```
+
+这样从 LSN 7 开始，就能沿着：
+
+```text
+7 -> 6 -> 2 -> 1 -> 0
+```
+
+倒着撤销 T0 的全部修改。
+
+本项目用静态 map 辅助维护每个事务上一条日志：
+
+```cpp
+static std::unordered_map<txn_id_t, lsn_t> prev_lsn_map_;
+```
+
+创建某事务的新日志时：
+
+```text
+log.prev_lsn = prev_lsn_map_[txn_id] 或 INVALID_LSN
+log.lsn = next_lsn++
+prev_lsn_map_[txn_id] = log.lsn
+```
+
+这就是 `recovery_manager_test.cpp` 一开始检查的内容。
+
+#### 2.5 日志类型
+
+本实验定义了这些日志类型：
+
+```cpp
+enum class LogRecType {
+    kInvalid,
+    kInsert,
+    kDelete,
+    kUpdate,
+    kBegin,
+    kCommit,
+    kAbort,
+};
+```
+
+每种日志的含义如下：
+
+| 类型 | 含义 | Redo 要做什么 | Undo 要做什么 |
+| --- | --- | --- | --- |
+| `kBegin` | 事务开始 | 把事务加入活跃事务表 | 通常不改数据 |
+| `kCommit` | 事务提交 | 把事务从活跃事务表移除 | 不需要撤销 |
+| `kAbort` | 事务中止 | 恢复时确认该事务应被撤销 | 不需要再作为活跃事务保留 |
+| `kInsert` | 插入 key/value | 插入该 key/value | 删除该 key |
+| `kDelete` | 删除 key/value | 删除该 key | 恢复旧 key/value |
+| `kUpdate` | 更新 key/value | 写入新 key/value | 恢复旧 key/value |
+
+注意：真实数据库中的 delete 可能是逻辑删除和物理删除两阶段；本测试中的 delete 简化成：
+
+```text
+Redo delete: data.erase(key)
+Undo delete: data[key] = old_value
+```
+
+#### 2.6 什么是 Checkpoint
+
+如果数据库从系统创建以来已经运行了几天，日志可能非常长。崩溃恢复时从第一条日志开始扫描会很慢，所以数据库会定期做 checkpoint。
+
+Checkpoint 可以理解为一个恢复快照。本项目中的结构是：
+
+```cpp
+struct CheckPoint {
+    lsn_t checkpoint_lsn_;
+    ATT active_txns_;
+    KvDatabase persist_data_;
+};
+```
+
+含义：
+
+- `checkpoint_lsn_`：检查点发生时的日志位置。
+- `active_txns_`：检查点时仍未结束的事务，以及它们最后一条日志 LSN。
+- `persist_data_`：检查点时已经持久化的数据状态。
+
+实验六中的恢复不是从空数据库开始，而是从 checkpoint 恢复：
+
+```text
+data_ = checkpoint.persist_data_
+active_txns_ = checkpoint.active_txns_
+persist_lsn_ = checkpoint.checkpoint_lsn_
+```
+
+然后从检查点之后的日志继续 Redo。
+
+#### 2.7 Redo 和 Undo 的直觉
+
+Redo 的直觉是：
+
+```text
+我不知道崩溃前哪些修改真的写进了磁盘，所以把应该发生过的修改再做一遍。
+```
+
+Undo 的直觉是：
+
+```text
+崩溃时还没提交的事务不能留下影响，所以把它们倒着撤销。
+```
+
+这就是 ARIES 恢复算法的基本精神：
+
+```text
+Analysis：确定哪些事务是活跃事务
+Redo：重复历史
+Undo：撤销 loser transactions
+```
+
+本实验把 Analysis 简化到了 checkpoint 和 Redo 中，没有单独写一个 `AnalysisPhase`。
+
+### 3. LogRec 设计指导
+
+当前 `LogRec` 框架里只有：
+
+```cpp
+LogRecType type_{LogRecType::kInvalid};
+lsn_t lsn_{INVALID_LSN};
+lsn_t prev_lsn_{INVALID_LSN};
+```
+
+但测试创建日志时需要事务 id 和 key/value：
+
+```cpp
+CreateUpdateLog(0, "A", 2000, "A", 2050)
+CreateDeleteLog(0, "B", 1000)
+CreateInsertLog(1, "C", 600)
+```
+
+所以你需要在 `LogRec` 中添加字段。推荐有两种设计。
+
+第一种：统一字段设计。
+
+```cpp
+txn_id_t txn_id_{INVALID_TXN_ID};
+KeyType old_key_{};
+ValType old_val_{};
+KeyType new_key_{};
+ValType new_val_{};
+```
+
+不同日志使用字段的方式：
+
+| 日志 | old_key / old_val | new_key / new_val |
+| --- | --- | --- |
+| Insert | 不使用 | 插入的 key/value |
+| Delete | 删除前的 key/value | 不使用 |
+| Update | 更新前的 key/value | 更新后的 key/value |
+| Begin / Commit / Abort | 不使用 | 不使用 |
+
+第二种：分开字段设计。
+
+```cpp
+txn_id_t txn_id_{INVALID_TXN_ID};
+KeyType ins_key_{};
+ValType ins_val_{};
+KeyType del_key_{};
+ValType del_val_{};
+KeyType old_key_{};
+ValType old_val_{};
+KeyType new_key_{};
+ValType new_val_{};
+```
+
+第二种读起来直观，但字段更多。第一种更简洁，推荐第一种。
+
+如果编译器报 `std::shared_ptr` 未定义，可以在 `log_rec.h` 顶部显式加：
+
+```cpp
+#include <memory>
+```
+
+### 4. 日志创建函数
+
+所有 `CreateXXXLog` 都应该遵守同一套流程：
+
+```text
+1. 创建 LogRec 对象。
+2. 设置 type。
+3. 设置 txn_id。
+4. 分配 lsn = next_lsn_++。
+5. 根据 prev_lsn_map_ 设置 prev_lsn。
+6. 更新 prev_lsn_map_[txn_id] = 当前 lsn。
+7. 设置该类型需要的 key/value。
+8. 返回 shared_ptr。
+```
+
+可以抽一个辅助思路，虽然不一定要真的写成函数：
+
+```cpp
+auto log = std::make_shared<LogRec>();
+log->txn_id_ = txn_id;
+log->lsn_ = LogRec::next_lsn_++;
+
+auto iter = LogRec::prev_lsn_map_.find(txn_id);
+if (iter == LogRec::prev_lsn_map_.end()) {
+  log->prev_lsn_ = INVALID_LSN;
+} else {
+  log->prev_lsn_ = iter->second;
+}
+
+LogRec::prev_lsn_map_[txn_id] = log->lsn_;
+```
+
+#### 4.1 CreateBeginLog
+
+Begin 日志表示事务开始。
+
+```text
+type = kBegin
+prev_lsn = 该事务之前没有日志时为 INVALID_LSN
+```
+
+测试会检查：
+
+```cpp
+ASSERT_EQ(INVALID_LSN, d0->prev_lsn_);
+ASSERT_EQ(INVALID_LSN, d3->prev_lsn_);
+```
+
+说明新事务第一条日志的 `prev_lsn_` 必须是 `INVALID_LSN`。
+
+#### 4.2 CreateInsertLog
+
+Insert 日志表示插入一个 key/value。
+
+例如：
+
+```cpp
+CreateInsertLog(1, "C", 600)
+```
+
+语义是：
+
+```text
+事务 T1 插入 C = 600
+```
+
+Redo 时：
+
+```text
+data_["C"] = 600
+```
+
+Undo 时：
+
+```text
+data_.erase("C")
+```
+
+#### 4.3 CreateDeleteLog
+
+Delete 日志表示删除一个已有 key，同时要保存旧值。
+
+例如：
+
+```cpp
+CreateDeleteLog(0, "B", 1000)
+```
+
+语义是：
+
+```text
+事务 T0 删除 B，删除前 B = 1000
+```
+
+Redo 时：
+
+```text
+data_.erase("B")
+```
+
+Undo 时：
+
+```text
+data_["B"] = 1000
+```
+
+为什么 delete 要保存旧值？因为如果事务回滚，要能把被删数据恢复回来。
+
+#### 4.4 CreateUpdateLog
+
+Update 日志表示把旧 key/value 改成新 key/value。
+
+例如：
+
+```cpp
+CreateUpdateLog(0, "A", 2000, "A", 2050)
+```
+
+语义是：
+
+```text
+事务 T0 把 A 从 2000 改成 2050
+```
+
+Redo 时：
+
+```text
+data_["A"] = 2050
+```
+
+Undo 时：
+
+```text
+data_["A"] = 2000
+```
+
+为什么参数里有 `old_key` 和 `new_key`？因为有些更新可能改变 key。虽然测试里 old_key 和 new_key 都是同一个字母，但接口设计允许：
+
+```text
+old_key = "A"
+new_key = "A_new"
+```
+
+这种情况下 Redo 要删除旧 key 并写入新 key，Undo 要删除新 key 并恢复旧 key。
+
+#### 4.5 CreateCommitLog 和 CreateAbortLog
+
+Commit 表示事务成功结束。
+
+```text
+Redo commit: 从 active_txns_ 删除该事务
+Undo commit: 不做事
+```
+
+Abort 表示事务主动中止。
+
+```text
+Redo abort: 应确保该事务的影响被撤销，并从 active_txns_ 删除
+Undo abort: 不需要再次撤销
+```
+
+在真实 ARIES 中，Abort 过程中还会写 CLR，也就是 Compensation Log Record，用于记录“已经撤销了某条日志”。本实验没有 CLR，所以可以把 `Abort` 简化理解为：恢复时看到该事务 abort，就沿着它的日志链把它撤销掉。
+
+### 5. RecoveryManager 成员
+
+`RecoveryManager` 中的成员是：
+
+```cpp
+std::map<lsn_t, LogRecPtr> log_recs_{};
+lsn_t persist_lsn_{INVALID_LSN};
+ATT active_txns_{};
+KvDatabase data_{};
+```
+
+逐个解释：
+
+- `log_recs_`：所有日志，按 LSN 排序。用 `std::map` 是为了 Redo 时能按 LSN 从小到大扫描。
+- `persist_lsn_`：检查点 LSN，也就是恢复扫描的起点。
+- `active_txns_`：活跃事务表，记录当前仍未提交/未中止的事务，以及它们最后一条日志 LSN。
+- `data_`：模拟数据库的数据状态。
+
+`ATT` 是 Active Transaction Table：
+
+```cpp
+using ATT = std::unordered_map<txn_id_t, lsn_t>;
+```
+
+它的含义是：
+
+```text
+txn_id -> 该事务最后一条日志的 LSN
+```
+
+Undo 时就从这些 last_lsn 开始倒着找。
+
+### 6. Init 实现指导
+
+`Init(CheckPoint &last_checkpoint)` 要把恢复管理器初始化到检查点状态。
+
+步骤：
+
+```text
+persist_lsn_ = last_checkpoint.checkpoint_lsn_
+active_txns_ = last_checkpoint.active_txns_
+data_ = last_checkpoint.persist_data_
+```
+
+测试中的 checkpoint 是：
+
+```cpp
+checkpoint.checkpoint_lsn_ = d3->lsn_;
+checkpoint.AddActiveTxn(0, d2->lsn_);
+checkpoint.AddActiveTxn(1, d3->lsn_);
+checkpoint.AddData("A", 2050);
+```
+
+含义：
+
+```text
+检查点位置：LSN d3
+检查点时 T0 活跃，最后日志是 d2
+检查点时 T1 活跃，最后日志是 d3
+检查点时磁盘数据中 A = 2050
+```
+
+所以 `Init` 之后：
+
+```text
+data_ = { A: 2050 }
+active_txns_ = { T0: d2, T1: d3 }
+persist_lsn_ = d3
+```
+
+### 7. RedoPhase 实现指导
+
+RedoPhase 的目标是“重复历史”。
+
+在本实验中，Redo 扫描日志时要做两件事：
+
+1. 把检查点之后的 insert/delete/update 再执行一遍。
+2. 维护 active transaction table，遇到 commit/abort 时更新事务状态。
+
+推荐扫描范围：
+
+```text
+遍历 log_recs_ 中 lsn > persist_lsn_ 的日志
+```
+
+如果你从 `lsn >= persist_lsn_` 开始，一般也能通过这个测试，但概念上 checkpoint 已经代表该位置之前的数据状态，通常从 checkpoint 后继续更清晰。
+
+各类型处理规则：
+
+```text
+kBegin:
+  active_txns_[txn_id] = log.lsn
+
+kInsert:
+  data_[new_key] = new_val
+  active_txns_[txn_id] = log.lsn
+
+kDelete:
+  data_.erase(old_key)
+  active_txns_[txn_id] = log.lsn
+
+kUpdate:
+  if old_key != new_key:
+    data_.erase(old_key)
+  data_[new_key] = new_val
+  active_txns_[txn_id] = log.lsn
+
+kCommit:
+  active_txns_.erase(txn_id)
+
+kAbort:
+  按该事务日志链执行一次 undo
+  active_txns_.erase(txn_id)
+```
+
+为什么 Redo 阶段遇到 Abort 要撤销？
+
+看测试里的 T0：
+
+```cpp
+d0: <T0 Begin>
+d1: <T0, A, 2000, 2050>
+d2: <T0, B, 1000, ->
+...
+d6: <T0, C, 600, 700>
+d7: <T0, Abort>
+```
+
+崩溃前 T0 已经 abort。恢复后它不应该继续留在 active_txns_ 等 UndoPhase 处理，而应该在 RedoPhase 中根据 abort 语义被恢复到未发生状态。
+
+测试在 `RedoPhase()` 后立即断言：
+
+```cpp
+ASSERT_EQ(db["A"], 2000);
+ASSERT_EQ(db["B"], 1000);
+ASSERT_EQ(db["C"], 800);
+ASSERT_EQ(db["D"], 30000);
+```
+
+这里 `A=2000` 和 `B=1000` 正是 T0 abort 后的效果：
+
+```text
+撤销 d1：A 从 2050 回到 2000
+撤销 d2：B 被恢复为 1000
+撤销 d6：C 从 700 回到 600
+```
+
+之后 T2 的 update 又把 `C` 从 600 改到 800，所以 Redo 结束时 `C=800`。
+
+### 8. UndoPhase 实现指导
+
+UndoPhase 的目标是撤销崩溃时仍然活跃、没有 commit、没有 abort 的事务。
+
+Redo 结束后，`active_txns_` 中剩下的就是 loser transactions。
+
+在测试里：
+
+```text
+T1 已 commit，不在 active_txns_
+T0 已 abort，不在 active_txns_
+T2 begin 后没有 commit/abort，仍在 active_txns_
+```
+
+所以 UndoPhase 只需要撤销 T2：
+
+```cpp
+d8:  <T2 Start>
+d9:  <T2, D, -, 30000>
+d10: <T2, C, 600, 800>
+```
+
+倒着撤销：
+
+```text
+undo d10: C 从 800 恢复为 600
+undo d9: 删除 D
+遇到 d8 begin，停止
+```
+
+因此 Undo 后测试期望：
+
+```cpp
+ASSERT_EQ(db["A"], 2000);
+ASSERT_EQ(db["B"], 1000);
+ASSERT_EQ(db["C"], 600);
+ASSERT_EQ(db.count("D"), 0);
+```
+
+#### 8.1 单个事务如何 Undo
+
+建议你写一个辅助思路：
+
+```text
+UndoTxn(last_lsn):
+  cur_lsn = last_lsn
+  while cur_lsn != INVALID_LSN:
+    log = log_recs_[cur_lsn]
+    根据 log.type 执行反操作
+    if log.type == kBegin:
+      break
+    cur_lsn = log.prev_lsn
+```
+
+不同日志的反操作：
+
+```text
+undo insert:
+  data_.erase(new_key)
+
+undo delete:
+  data_[old_key] = old_val
+
+undo update:
+  if old_key != new_key:
+    data_.erase(new_key)
+  data_[old_key] = old_val
+
+undo begin / commit / abort:
+  不改 data
+```
+
+UndoPhase 可以遍历 `active_txns_`：
+
+```text
+for each (txn_id, last_lsn) in active_txns_:
+  UndoTxn(last_lsn)
+active_txns_.clear()
+```
+
+注意：遍历时不要一边遍历 unordered_map 一边随意 erase 当前元素，容易迭代器失效。可以先复制 last_lsn 列表，撤销完再 clear。
+
+### 9. 用测试完整推导一遍
+
+测试构造的日志顺序是：
+
+```text
+LSN 0:  d0  <T0 Begin>
+LSN 1:  d1  <T0, A, 2000 -> 2050>
+LSN 2:  d2  <T0, delete B=1000>
+LSN 3:  d3  <T1 Begin>
+
+checkpoint:
+  checkpoint_lsn = 3
+  active_txns = { T0: 2, T1: 3 }
+  persist_data = { A: 2050 }
+
+LSN 4:  d4  <T1, insert C=600>
+LSN 5:  d5  <T1 Commit>
+LSN 6:  d6  <T0, C, 600 -> 700>
+LSN 7:  d7  <T0 Abort>
+LSN 8:  d8  <T2 Begin>
+LSN 9:  d9  <T2, insert D=30000>
+LSN 10: d10 <T2, C, 600 -> 800>
+```
+
+#### 9.1 Init 后
+
+```text
+data = { A: 2050 }
+active_txns = { T0: 2, T1: 3 }
+```
+
+#### 9.2 Redo 扫描
+
+从 checkpoint 后开始：
+
+```text
+d4 insert C=600
+  data = { A:2050, C:600 }
+  active T1 last = 4
+
+d5 commit T1
+  active_txns 删除 T1
+
+d6 update C 600->700
+  data = { A:2050, C:700 }
+  active T0 last = 6
+
+d7 abort T0
+  undo T0:
+    undo d6: C=600
+    undo d2: B=1000
+    undo d1: A=2000
+  active_txns 删除 T0
+  data = { A:2000, B:1000, C:600 }
+
+d8 begin T2
+  active T2 last = 8
+
+d9 insert D=30000
+  data = { A:2000, B:1000, C:600, D:30000 }
+  active T2 last = 9
+
+d10 update C 600->800
+  data = { A:2000, B:1000, C:800, D:30000 }
+  active T2 last = 10
+```
+
+所以 Redo 后符合测试：
+
+```text
+A = 2000
+B = 1000
+C = 800
+D = 30000
+```
+
+#### 9.3 UndoPhase
+
+Redo 结束后只剩：
+
+```text
+active_txns = { T2: 10 }
+```
+
+倒着撤销 T2：
+
+```text
+undo d10 update C 600->800:
+  C = 600
+
+undo d9 insert D=30000:
+  删除 D
+
+遇到 d8 begin:
+  停止
+```
+
+Undo 后：
+
+```text
+A = 2000
+B = 1000
+C = 600
+D 不存在
+```
+
+这正是测试最终断言。
+
+### 10. 和真实 MiniSQL 数据页恢复的关系
+
+虽然本实验用 `KvDatabase` 做简化，但它和真实表页恢复是一一对应的。
+
+真实数据库里，日志不会只写 `"A", 2050`，而会记录更多信息，例如：
+
+```text
+InsertLog:
+  txn_id
+  table_id 或 page_id
+  rid
+  inserted tuple
+
+DeleteLog:
+  txn_id
+  table_id 或 page_id
+  rid
+  deleted tuple
+
+UpdateLog:
+  txn_id
+  table_id 或 page_id
+  rid
+  old tuple
+  new tuple
+```
+
+Redo 对应：
+
+- Insert：重新插入 tuple。
+- Delete：重新标记删除或物理删除。
+- Update：重新写入 new tuple。
+
+Undo 对应：
+
+- Insert：删除刚插入的 tuple。
+- Delete：恢复 deleted tuple。
+- Update：把 new tuple 改回 old tuple。
+
+你前面在 `TablePage` 中已经见过这些接口：
+
+- `InsertTuple`
+- `MarkDelete`
+- `ApplyDelete`
+- `RollbackDelete`
+- `UpdateTuple`
+
+这说明实验六并不是孤立的。它是在为完整事务系统准备理论基础：表页修改时要写日志，事务提交/回滚时要根据日志决定数据最终状态。
+
+### 11. 推荐实现顺序
+
+建议按下面顺序写，最稳：
+
+1. 在 `LogRec` 中补字段：
+   - `txn_id_`
+   - `old_key_ / old_val_`
+   - `new_key_ / new_val_`
+2. 实现一个统一的日志初始化逻辑：
+   - 分配 `lsn_`
+   - 设置 `prev_lsn_`
+   - 更新 `prev_lsn_map_`
+3. 实现六个 `CreateXXXLog`：
+   - Begin
+   - Commit
+   - Abort
+   - Insert
+   - Delete
+   - Update
+4. 实现 `RecoveryManager::Init`。
+5. 写一个概念上的 `RedoOneLog`：
+   - insert / delete / update 怎么改 `data_`
+   - begin / commit / abort 怎么改 `active_txns_`
+6. 写一个概念上的 `UndoTxn(last_lsn)`：
+   - 沿 `prev_lsn_` 倒着找。
+   - 对 insert/delete/update 做反操作。
+7. 在 `RedoPhase` 中处理 abort：
+   - 看到 abort 时撤销该事务。
+   - 从 `active_txns_` 中移除该事务。
+8. 在 `UndoPhase` 中撤销剩余 active transactions。
+9. 跑测试：
+
+```bash
+make recovery_manager_test -j
+./test/recovery_manager_test
+```
+
+如果你跑的是全部测试：
+
+```bash
+make minisql_test -j
+./test/minisql_test
+```
+
+但实验六开发时建议先跑单测，反馈更快。
+
+### 12. 常见错误清单
+
+1. `CreateBeginLog` 没有把新事务的 `prev_lsn_` 设为 `INVALID_LSN`。
+2. 创建日志后忘记更新 `prev_lsn_map_[txn_id]`，导致后续日志链断掉。
+3. `lsn_` 没有用 `next_lsn_++` 递增，导致 `std::map<lsn_t, LogRecPtr>` 覆盖日志。
+4. `LogRec` 没保存 `txn_id_`，RecoveryManager 无法维护 active transaction table。
+5. Insert 日志没有保存新值，Redo 时无法插入。
+6. Delete 日志没有保存旧值，Undo 时无法恢复。
+7. Update 日志只保存新值，没有保存旧值，Undo 时无法回滚。
+8. `Init` 只设置 checkpoint LSN，忘了复制 `persist_data_`。
+9. `Init` 忘了复制 checkpoint 中的 active transactions。
+10. Redo 从头扫描时没有考虑 checkpoint 初始状态，可能重复应用 checkpoint 前的日志。
+11. Redo 遇到 commit 后没有从 `active_txns_` 删除事务。
+12. Redo 遇到 abort 后只删除 active txn，没有撤销它已经做过的修改。
+13. Undo 正向扫描事务日志，撤销顺序错误；Undo 必须从 last_lsn 倒着走。
+14. Undo insert 时错误地保留了插入值，应该删除 key。
+15. Undo delete 时错误地删除 key，应该恢复旧值。
+16. Undo update 时写成新值，应该恢复旧值。
+17. 遍历 `active_txns_` 时边遍历边 erase，导致迭代器失效。
+18. 使用 `data_[key]` 检查 key 是否存在，意外插入默认值；检查存在性时用 `count` 或 `find`。
+19. Abort 后没有从 `active_txns_` 移除，导致 UndoPhase 又撤销一遍。
+20. 对 old_key 和 new_key 不同的 update 没处理，导致改 key 的更新恢复错误。
+
+### 13. 验收问答准备
+
+问题：Recovery Manager 解决什么问题？
+
+回答要点：它在数据库崩溃后根据日志恢复数据状态，保证已提交事务的结果不丢，未提交或已中止事务的影响被撤销，从而维护事务的原子性和持久性。
+
+问题：什么是 WAL？
+
+回答要点：WAL 是预写日志。数据页写入磁盘前，描述该修改的日志必须先写入磁盘。这样崩溃后才能根据日志判断修改应当重做还是撤销。
+
+问题：LSN 有什么作用？
+
+回答要点：LSN 是日志序列号，用来确定日志全局顺序、从 checkpoint 后继续扫描，以及通过 `prev_lsn_` 串起单个事务自己的日志链。
+
+问题：`prev_lsn_` 为什么重要？
+
+回答要点：Undo 时需要倒着撤销某个事务自己的修改。`prev_lsn_` 让我们可以从事务最后一条日志一路回到 begin，而不需要反复扫描全部日志。
+
+问题：Redo 和 Undo 的区别是什么？
+
+回答要点：Redo 是重复历史，把崩溃前可能已经发生的修改再做一遍；Undo 是撤销崩溃时仍未提交的 loser transactions，保证未完成事务不留下影响。
+
+问题：Checkpoint 中为什么要保存 active transaction table？
+
+回答要点：检查点时有些事务还没结束。恢复时必须知道这些事务最后一条日志在哪里，后续如果它们没有 commit，就要从这些 LSN 开始 Undo。
+
+问题：为什么 Delete 日志要保存旧值？
+
+回答要点：删除事务如果回滚或崩溃后需要 Undo，必须知道被删数据原来是什么，才能恢复。
+
+问题：为什么 Update 日志要同时保存 old value 和 new value？
+
+回答要点：Redo 需要 new value 重做更新，Undo 需要 old value 撤销更新。只保存其中一个无法同时支持 Redo 和 Undo。
+
+问题：为什么 Redo 遇到 abort 要处理？
+
+回答要点：本实验没有 CLR，abort 日志表示该事务已经决定中止。恢复时看到 abort 后，应沿事务日志链撤销该事务的影响，并把它从 active transaction table 中移除。
+
+问题：UndoPhase 撤销哪些事务？
+
+回答要点：撤销 Redo 结束后仍留在 `active_txns_` 中的事务。这些事务在崩溃时没有 commit，也没有 abort，属于 loser transactions。
+
+### 14. 本实验完成标准
+
+完成实验六后，你应该能做到：
+
+1. `CreateXXXLog` 生成正确类型、正确 LSN、正确 `prev_lsn_` 的日志。
+2. 每条日志保存恢复所需的事务 id 和 key/value。
+3. `Init` 能从 checkpoint 恢复 `persist_lsn_`、`active_txns_` 和 `data_`。
+4. `RedoPhase` 能重做 insert/delete/update，并正确处理 commit/abort。
+5. `UndoPhase` 能撤销剩余未完成事务。
+6. `recovery_manager_test` 通过。
+
+到这里，你已经掌握了数据库崩溃恢复的骨架。下一节 Lock Manager 会换一个角度解决并发问题：多个事务同时读写同一条记录时，如何用锁保证隔离性，并在出现死锁时检测和处理。
+
+## 实验七：Lock Manager
+
+### 1. 实验目标
+
+实验七要解决的是数据库并发控制问题。前面的实验已经能让 MiniSQL 存数据、查数据、建索引、执行 SQL、做简单恢复。但如果多个事务同时读写同一条记录，就会出现不一致。
+
+例如：
+
+```text
+T0 读取 A = 100
+T1 读取 A = 100
+T0 写回 A = 90
+T1 写回 A = 80
+```
+
+如果两个事务都认为自己基于最新值修改，最终就可能丢失其中一个事务的更新。这就是并发控制要避免的问题。
+
+本实验要实现的 `LockManager` 负责对记录级别的 `RowId` 加锁和解锁：
+
+1. 共享锁 Shared Lock：读锁，多个事务可以同时持有。
+2. 排他锁 Exclusive Lock：写锁，同一时刻只能一个事务持有，且不能和共享锁共存。
+3. 锁升级 Lock Upgrade：事务已经持有共享锁时，升级成排他锁。
+4. 两阶段封锁 2PL：事务释放锁后进入 shrinking 阶段，不能再获取新锁。
+5. 等待图 Waits-for Graph：记录事务之间的等待关系。
+6. 死锁检测 Deadlock Detection：后台线程周期性找环，选择一个事务 abort。
+
+对应文件：
+
+- `src/include/concurrency/lock_manager.h`
+- `src/concurrency/lock_manager.cpp`
+- `src/include/concurrency/txn.h`
+- `src/include/concurrency/txn_manager.h`
+- `src/concurrency/txn_manager.cpp`
+- `src/include/common/rowid.h`
+- `test/concurrency/lock_manager_test.cpp`
+
+对应测试：
+
+```bash
+make lock_manager_test -j
+./test/lock_manager_test
+```
+
+测试覆盖：
+
+- `SLockInReadUncommittedTest`
+- `TwoPhaseLockingTest`
+- `UpgradeLockInShrinkingPhase`
+- `UpgradeConflictTest`
+- `UpgradeTest`
+- `UpgradeAfterAbortTest`
+- `BasicCycleTest1`
+- `BasicCycleTest2`
+- `DeadlockDetectionTest1`
+- `DeadlockDetectionTest2`
+
+这一节是整个 MiniSQL 中最考验“状态机”和“并发等待”的实验。写代码前一定先把状态转换想清楚。
+
+### 2. 相关数据库知识
+
+#### 2.1 为什么需要锁
+
+数据库事务并发执行时，常见异常包括：
+
+- 脏读：读到另一个未提交事务写入的数据。
+- 不可重复读：同一事务两次读同一行，结果不同。
+- 丢失更新：两个事务同时更新同一数据，其中一个更新被覆盖。
+- 写写冲突：两个事务同时修改同一行。
+
+锁的作用是给读写操作建立互斥规则：
+
+```text
+读操作先拿共享锁
+写操作先拿排他锁
+读读可以并发
+读写、写读、写写不能并发
+```
+
+#### 2.2 共享锁和排他锁
+
+共享锁 `S`：
+
+```text
+事务 T0 持有 S(A) 时，其他事务仍然可以持有 S(A)
+```
+
+排他锁 `X`：
+
+```text
+事务 T0 持有 X(A) 时，其他事务不能再持有 S(A) 或 X(A)
+```
+
+兼容性表：
+
+| 已持有 \ 新请求 | Shared | Exclusive |
+| --- | --- | --- |
+| Shared | 兼容 | 不兼容 |
+| Exclusive | 不兼容 | 不兼容 |
+
+所以判断能否授予锁时，本质就是看当前 `RowId` 上已经 granted 的锁是否兼容。
+
+#### 2.3 锁粒度：本实验是记录锁
+
+本项目用 `RowId` 作为锁对象：
+
+```cpp
+class RowId {
+  page_id_t page_id_;
+  uint32_t slot_num_;
+};
+```
+
+它表示：
+
+```text
+某个表页 page_id 中的第 slot_num 条记录
+```
+
+因此 `lock_table_` 的 key 是 `RowId`：
+
+```cpp
+std::unordered_map<RowId, LockRequestQueue> lock_table_;
+```
+
+这叫记录级锁。真实数据库还可能有表锁、页锁、意向锁、多粒度锁，但本实验只需要记录锁。
+
+#### 2.4 事务状态
+
+事务状态定义在 `txn.h`：
+
+```cpp
+enum class TxnState {
+  kGrowing,
+  kShrinking,
+  kCommitted,
+  kAborted
+};
+```
+
+含义：
+
+- `Growing`：增长阶段，可以获取新锁。
+- `Shrinking`：收缩阶段，只能释放锁，不能获取新锁。
+- `Committed`：事务成功提交。
+- `Aborted`：事务被中止。
+
+测试中非常关注状态转换。例如：
+
+```cpp
+res = lock_mgr_->Unlock(txn, r0);
+ASSERT_TRUE(res);
+CheckShrinking(*txn);
+```
+
+说明默认隔离级别下，事务一旦释放锁，就应该进入 `Shrinking`。
+
+#### 2.5 什么是两阶段封锁 2PL
+
+2PL 是 Two-Phase Locking，两阶段封锁。
+
+它把事务生命周期分成两个阶段：
+
+```text
+Growing phase:
+  可以加锁
+  不应该释放锁
+
+Shrinking phase:
+  可以释放锁
+  不能再加新锁
+```
+
+只要所有事务都遵守 2PL，就能保证冲突可串行化。
+
+本实验测试：
+
+```cpp
+LockShared(txn, r0)      // OK, Growing
+LockExclusive(txn, r1)   // OK, Growing
+Unlock(txn, r0)          // 进入 Shrinking
+LockShared(txn, r0)      // 应该 abort
+```
+
+如果事务在 shrinking 阶段申请锁，要：
+
+```text
+txn->SetState(kAborted)
+throw TxnAbortException(txn_id, AbortReason::kLockOnShrinking)
+```
+
+#### 2.6 隔离级别
+
+本项目定义了三种隔离级别：
+
+```cpp
+enum class IsolationLevel {
+  kReadUncommitted,
+  kReadCommitted,
+  kRepeatedRead
+};
+```
+
+课程框架里拼写是 `kRepeatedRead`，语义上就是 Repeatable Read。
+
+测试明确要求：
+
+```cpp
+Txn t{0, IsolationLevel::kReadUncommitted};
+lock_mgr_->LockShared(&t, r1);
+```
+
+应该抛出：
+
+```cpp
+AbortReason::kLockSharedOnReadUncommitted
+```
+
+原因是 Read Uncommitted 允许脏读，读操作不应该申请共享锁。你可以这样理解：
+
+```text
+Read Uncommitted:
+  不拿 S 锁，直接读
+
+Read Committed:
+  可以拿 S 锁，读完可较早释放
+
+Repeatable Read:
+  按 2PL 持有锁，避免不可重复读
+```
+
+本实验单测主要围绕默认的 `kRepeatedRead`，但 `LockShared` 中必须专门处理 Read Uncommitted。
+
+### 3. 项目接口结构
+
+#### 3.1 LockRequest
+
+每个锁请求是：
+
+```cpp
+class LockRequest {
+ public:
+  txn_id_t txn_id_;
+  LockMode lock_mode_;
+  LockMode granted_;
+};
+```
+
+含义：
+
+- `txn_id_`：哪个事务发起请求。
+- `lock_mode_`：它想要的锁类型。
+- `granted_`：已经授予的锁类型；`kNone` 表示还在等待。
+
+这两个 mode 要分清：
+
+```text
+lock_mode_ = kExclusive, granted_ = kNone
+表示正在等待排他锁
+
+lock_mode_ = kExclusive, granted_ = kExclusive
+表示已经拿到排他锁
+```
+
+#### 3.2 LockRequestQueue
+
+每个 `RowId` 有一个请求队列：
+
+```cpp
+class LockRequestQueue {
+ public:
+  ReqListType req_list_;
+  std::unordered_map<txn_id_t, ReqListType::iterator> req_list_iter_map_;
+  std::condition_variable cv_;
+  bool is_writing_;
+  bool is_upgrading_;
+  int32_t sharing_cnt_;
+};
+```
+
+含义：
+
+- `req_list_`：这个 RowId 上所有锁请求，包括已授予和等待中的。
+- `req_list_iter_map_`：根据 txn_id 快速找到请求位置。
+- `cv_`：等待锁的事务会阻塞在这里，被解锁或死锁检测唤醒。
+- `is_writing_`：当前是否有事务持有排他锁。
+- `is_upgrading_`：当前是否已经有事务正在从 S 升级到 X。
+- `sharing_cnt_`：当前持有共享锁的事务数量。
+
+判断是否能授予共享锁：
+
+```text
+!is_writing_
+并且没有更高优先级的排他锁阻塞策略要求等待
+```
+
+判断是否能授予排他锁：
+
+```text
+!is_writing_ && sharing_cnt_ == 0
+```
+
+判断升级是否能授予：
+
+```text
+!is_writing_ && sharing_cnt_ == 1
+```
+
+这里的 `sharing_cnt_ == 1` 表示只剩自己还持有共享锁，可以安全升级。
+
+#### 3.3 Txn 中的锁集合
+
+`Txn` 保存自己持有哪些锁：
+
+```cpp
+std::unordered_set<RowId> shared_lock_set_;
+std::unordered_set<RowId> exclusive_lock_set_;
+```
+
+它们的作用：
+
+1. 测试会检查集合大小。
+2. `TxnManager::Commit` 和 `TxnManager::Abort` 会释放事务持有的所有锁。
+
+`TxnManager::ReleaseLocks` 的逻辑是：
+
+```cpp
+for rid in exclusive_lock_set:
+  lock_mgr_->Unlock(txn, rid)
+for rid in shared_lock_set:
+  lock_mgr_->Unlock(txn, rid)
+```
+
+所以 `LockManager` 必须维护好这两个集合。只更新锁队列、不更新事务集合，会导致 commit/abort 无法释放锁。
+
+### 4. 加锁前的统一检查
+
+建议把公共检查放到 `LockPrepare` 中。
+
+#### 4.1 Shrinking 阶段不能加锁
+
+如果事务已经是 `kShrinking`，再申请任何锁都违反 2PL：
+
+```text
+txn->SetState(kAborted)
+throw TxnAbortException(txn_id, kLockOnShrinking)
+```
+
+测试覆盖：
+
+- `TwoPhaseLockingTest`
+- `UpgradeLockInShrinkingPhase`
+
+#### 4.2 Read Uncommitted 不能申请共享锁
+
+这个检查只适用于 `LockShared`：
+
+```text
+if isolation == kReadUncommitted:
+  txn->SetState(kAborted)
+  throw TxnAbortException(txn_id, kLockSharedOnReadUncommitted)
+```
+
+测试覆盖：
+
+- `SLockInReadUncommittedTest`
+
+#### 4.3 已经 Aborted 的事务被唤醒后要抛异常
+
+死锁检测线程不会直接在等待线程里抛异常。它只能把某个事务状态设置为 `kAborted`，然后唤醒等待线程。
+
+等待线程醒来后要检查：
+
+```text
+if txn->GetState() == kAborted:
+  清理自己的锁请求
+  throw TxnAbortException(txn_id, kDeadlock)
+```
+
+这就是 `CheckAbort` 应该做的事。
+
+测试覆盖：
+
+- `UpgradeAfterAbortTest`
+- `DeadlockDetectionTest1`
+- `DeadlockDetectionTest2`
+
+注意：`UpgradeAfterAbortTest` 中事务是被另一个线程调用 `txn_mgr_->Abort(t0)` 中止的，但测试仍期待 `LockUpgrade` 抛出 `kDeadlock`。所以在等待锁时，只要发现自己已经 `kAborted`，就按 `kDeadlock` 抛出即可。
+
+### 5. LockShared 实现指导
+
+`LockShared(txn, rid)` 的目标是给事务申请共享锁。
+
+步骤：
+
+```text
+1. 如果隔离级别是 Read Uncommitted，abort 并抛异常。
+2. 调用 LockPrepare 检查 shrinking / aborted。
+3. 拿全局 latch。
+4. 获取 lock_table_[rid] 对应的请求队列。
+5. 如果该事务已经持有 S 或 X，可以直接返回 true。
+6. 插入 LockRequest(txn_id, kShared)，granted = kNone。
+7. 如果当前没有 writer，就授予共享锁。
+8. 如果有 writer，就等待 cv。
+9. 每次醒来都检查事务是否 aborted。
+10. 成功授予后：
+    - request.granted_ = kShared
+    - sharing_cnt_++
+    - txn->GetSharedLockSet().insert(rid)
+    - 删除 waits-for graph 中该事务的相关等待边
+    - return true
+```
+
+伪代码：
+
+```cpp
+while (queue.is_writing_) {
+  为 txn 添加等待 writer 的边;
+  queue.cv_.wait(lock);
+  CheckAbort(txn, queue);
+}
+
+grant shared;
+```
+
+共享锁之间兼容，所以只要没有排他锁正在持有，多个事务都可以通过。
+
+### 6. LockExclusive 实现指导
+
+`LockExclusive(txn, rid)` 申请排他锁。
+
+步骤：
+
+```text
+1. 调用 LockPrepare。
+2. 拿全局 latch。
+3. 如果事务已经持有 X，直接返回 true。
+4. 如果事务已经持有 S，严格来说应调用 LockUpgrade，而不是直接 LockExclusive。
+5. 插入 LockRequest(txn_id, kExclusive)。
+6. 等待直到：
+   !queue.is_writing_ && queue.sharing_cnt_ == 0
+7. 等待期间为 waits-for graph 添加边：
+   当前事务 -> 所有已经 granted 且冲突的事务
+8. 成功授予后：
+   - request.granted_ = kExclusive
+   - queue.is_writing_ = true
+   - txn->GetExclusiveLockSet().insert(rid)
+   - 移除等待边
+   - return true
+```
+
+排他锁和任何锁都不兼容，所以只要还有共享锁或排他锁，就要等。
+
+这里有一个实现细节：等待图的边应指向“当前阻塞我的事务”。例如 T0 请求 X(r)，但 T1 和 T2 正持有 S(r)，则加边：
+
+```text
+T0 -> T1
+T0 -> T2
+```
+
+如果 T0 请求 X(r)，T1 正持有 X(r)，则加边：
+
+```text
+T0 -> T1
+```
+
+### 7. LockUpgrade 实现指导
+
+锁升级是实验七里最容易写错的部分。
+
+目标：
+
+```text
+事务已经持有 S(r)
+现在想升级成 X(r)
+```
+
+#### 7.1 为什么需要锁升级
+
+典型场景：
+
+```text
+事务先读取某行，拿 S 锁
+读完判断需要修改
+于是需要把 S 锁升级为 X 锁
+```
+
+如果直接先释放 S 再申请 X，中间可能被其他事务插入，破坏并发控制。所以数据库提供 upgrade 操作。
+
+#### 7.2 同一 RowId 只允许一个升级者
+
+如果两个事务都持有共享锁，又都想升级：
+
+```text
+T0 持有 S(r)，申请 X(r)
+T1 持有 S(r)，申请 X(r)
+```
+
+它们会互相等待对方释放共享锁，形成升级死锁。因此本实验用：
+
+```cpp
+bool is_upgrading_;
+```
+
+限制同一个 `RowId` 上只能有一个事务正在升级。
+
+如果 `is_upgrading_ == true`，第二个升级者要直接 abort：
+
+```text
+txn->SetState(kAborted)
+throw TxnAbortException(txn_id, kUpgradeConflict)
+```
+
+测试覆盖：
+
+- `UpgradeConflictTest`
+
+#### 7.3 升级时是否保留共享锁
+
+为了通过本项目的并发测试，升级等待期间应保留事务原来的共享锁。
+
+为什么？看 `UpgradeAfterAbortTest`：
+
+```text
+T0 持有 S(r)
+T1 持有 S(r)
+T0 开始升级并阻塞
+另一个线程 Abort(T0)
+```
+
+`TxnManager::Abort(T0)` 会通过 T0 的锁集合释放锁。如果你在升级开始时就把 T0 的共享锁从集合中删掉，Abort 就找不到该锁，也不会调用 `Unlock` 唤醒等待中的升级线程。
+
+更稳的流程是：
+
+```text
+1. 确认 txn 持有 S(r)。
+2. 如果已有其他升级者，abort 当前 txn。
+3. 设置 is_upgrading_ = true。
+4. 把该事务的请求 lock_mode_ 改为 kExclusive，但 granted_ 仍可保持 kShared 或等待转换。
+5. 等待直到：
+   !is_writing_ && sharing_cnt_ == 1
+   这个 1 就是自己持有的 S 锁。
+6. 成功后：
+   sharing_cnt_--
+   txn shared_lock_set 删除 rid
+   txn exclusive_lock_set 插入 rid
+   request.granted_ = kExclusive
+   queue.is_writing_ = true
+   queue.is_upgrading_ = false
+```
+
+升级等待时，等待图边应指向其他共享锁持有者：
+
+```text
+T0 upgrade r
+T1 仍持有 S(r)
+添加边 T0 -> T1
+```
+
+不要添加 `T0 -> T0` 自环。
+
+### 8. Unlock 实现指导
+
+`Unlock(txn, rid)` 释放事务在某个 RowId 上持有的锁。
+
+步骤：
+
+```text
+1. 拿全局 latch。
+2. 找到 lock_table_[rid]。
+3. 找到当前 txn 的 LockRequest。
+4. 根据 granted_ 判断释放 S 还是 X。
+5. 如果释放 S：
+   - sharing_cnt_--
+   - txn->GetSharedLockSet().erase(rid)
+6. 如果释放 X：
+   - is_writing_ = false
+   - txn->GetExclusiveLockSet().erase(rid)
+7. 从请求队列中删除该事务请求。
+8. 如果事务状态是 Growing，设置为 Shrinking。
+9. 清理等待图中和该事务相关的边。
+10. cv_.notify_all() 唤醒等待者。
+11. return true
+```
+
+测试中默认事务是 `kRepeatedRead`，释放锁后应进入 shrinking：
+
+```cpp
+res = lock_mgr_->Unlock(txn, r0);
+ASSERT_TRUE(res);
+CheckShrinking(*txn);
+```
+
+如果事务正在 Commit 或 Abort，`TxnManager` 会先把状态设置成 `Committed` 或 `Aborted`，再释放锁：
+
+```cpp
+txn->SetState(TxnState::kCommitted);
+ReleaseLocks(txn);
+```
+
+所以 `Unlock` 中设置 shrinking 时要注意：
+
+```text
+只有当前状态还是 Growing 时才改 Shrinking
+不要把 Committed / Aborted 改回 Shrinking
+```
+
+### 9. 等待图 Waits-for Graph
+
+死锁检测依赖等待图。
+
+```cpp
+std::unordered_map<txn_id_t, std::set<txn_id_t>> waits_for_;
+```
+
+含义：
+
+```text
+waits_for_[T0] = {T1, T2}
+表示 T0 正在等待 T1 和 T2 释放锁
+```
+
+#### 9.1 AddEdge
+
+```cpp
+void AddEdge(txn_id_t t1, txn_id_t t2);
+```
+
+表示：
+
+```text
+t1 waits for t2
+```
+
+实现就是：
+
+```text
+waits_for_[t1].insert(t2)
+```
+
+用 `std::set` 的好处是：
+
+1. 自动去重。
+2. 遍历邻居时天然按 txn_id 从小到大。
+
+#### 9.2 RemoveEdge
+
+```cpp
+void RemoveEdge(txn_id_t t1, txn_id_t t2);
+```
+
+删除：
+
+```text
+t1 -> t2
+```
+
+如果 `waits_for_[t1]` 删除后为空，可以把这个 key 也删掉。
+
+#### 9.3 GetEdgeList
+
+测试只检查边数量，但建议返回稳定顺序：
+
+```text
+遍历 waits_for_
+  遍历 set 中的每个 to
+  push_back({from, to})
+```
+
+如果你想让输出顺序也稳定，可以把结果 sort 一下。
+
+### 10. HasCycle 实现指导
+
+`HasCycle(txn_id_t &newest_tid_in_cycle)` 要检测等待图中是否有环。如果有环，返回 true，并把环中最大的事务 id 写入输出参数。
+
+为什么选择最大事务 id？
+
+这是常见的 victim 策略：事务 id 越大，通常越年轻；杀掉年轻事务浪费更少。
+
+#### 10.1 为什么 DFS 要按事务 id 升序
+
+测试 `BasicCycleTest2` 很依赖“先找到哪个环”。
+
+边为：
+
+```text
+0 -> 1
+1 -> 2
+2 -> 5
+5 -> 1
+2 -> 4
+1 -> 3
+3 -> 6
+6 -> 0
+```
+
+图里至少有两个环：
+
+```text
+1 -> 2 -> 5 -> 1   最大 txn_id = 5
+0 -> 1 -> 3 -> 6 -> 0   最大 txn_id = 6
+```
+
+测试第一次期待返回 5：
+
+```cpp
+ASSERT_EQ(5, newest_tid_in_cycle);
+```
+
+所以 DFS 应该从最小 txn_id 开始，并且邻接点也按从小到大遍历。因为 `waits_for_` 是 unordered_map，不能直接依赖它的遍历顺序。推荐：
+
+```text
+1. 收集所有图中的 txn id。
+2. 排序。
+3. 按升序作为 DFS 起点。
+4. 邻接点来自 std::set，本身升序。
+```
+
+#### 10.2 DFS 状态
+
+常见写法需要三个概念：
+
+- `visited`：已经完整搜索过的节点。
+- `on_path`：当前 DFS 栈上的节点。
+- `path`：当前路径，用于找到环中有哪些节点。
+
+当 DFS 遇到一个已经在 `on_path` 中的节点，说明有环。
+
+例如当前路径：
+
+```text
+0 -> 1 -> 2 -> 5
+```
+
+如果从 5 又走到 1，环就是：
+
+```text
+1 -> 2 -> 5 -> 1
+```
+
+环中的最大事务 id 是 5。
+
+#### 10.3 本项目已有辅助成员
+
+头文件里有：
+
+```cpp
+std::unordered_set<txn_id_t> visited_set_;
+std::stack<txn_id_t> visited_path_;
+txn_id_t revisited_node_{INVALID_TXN_ID};
+```
+
+你可以用这些成员，也可以在 `HasCycle` 里用局部变量实现。更推荐局部变量，逻辑更清楚，也避免多次调用时旧状态没清干净。
+
+无论哪种方式，每次 `HasCycle` 开始时都应清空上一次检测状态。
+
+### 11. RunCycleDetection 实现指导
+
+`RunCycleDetection` 是后台死锁检测线程。
+
+测试中这样启动：
+
+```cpp
+lock_mgr_->EnableCycleDetection(interval);
+std::thread detect_worker(std::bind(&LockManager::RunCycleDetection, lock_mgr_));
+...
+lock_mgr_->DisableCycleDetection();
+detect_worker.join();
+```
+
+所以 `RunCycleDetection` 应该是循环：
+
+```text
+while enable_cycle_detection_:
+  sleep(cycle_detection_interval_)
+  加锁 latch_
+  while HasCycle(victim):
+    victim_txn = txn_mgr_->GetTransaction(victim)
+    victim_txn->SetState(kAborted)
+    DeleteNode(victim)
+    唤醒所有 lock_table_ 中的 cv_
+  释放 latch_
+```
+
+为什么要 `while HasCycle`？
+
+因为一次图中可能有多个死锁环。`DeadlockDetectionTest2` 里就需要连续 abort 多个事务，最后让剩余事务继续运行。
+
+为什么只设置事务状态，不一定直接释放锁？
+
+等待中的事务被唤醒后会发现自己已经 `kAborted`，然后抛出 `TxnAbortException`。测试线程 catch 到异常后会调用：
+
+```cpp
+txn_mgr_->Abort(txn);
+```
+
+这一步会释放它已经持有的锁。你也可以在检测线程里更主动地清理，但要非常小心不要和测试线程重复释放锁。教学上推荐遵循测试语义：检测线程标记 abort 并唤醒，事务线程负责走 abort 流程。
+
+### 12. DeleteNode 的作用
+
+当前 `DeleteNode` 已经给了一部分实现：
+
+```cpp
+waits_for_.erase(txn_id);
+auto *txn = txn_mgr_->GetTransaction(txn_id);
+...
+RemoveEdge(lock_req.txn_id_, txn_id);
+```
+
+它的目标是从等待图中删除某个事务相关的边：
+
+1. 删除该事务发出的所有边。
+2. 删除其他事务指向该事务的边。
+
+死锁检测选择 victim 后，要从等待图里移除 victim，否则下一轮检测还会反复发现同一个环。
+
+注意：`DeleteNode` 使用 `txn_mgr_->GetTransaction(txn_id)` 取事务对象，所以 `TxnManager` 必须已经通过 `SetTxnMgr` 和 `LockManager` 关联。构造函数里已经做了：
+
+```cpp
+TxnManager::TxnManager(LockManager *lock_mgr)
+  : lock_mgr_(lock_mgr) {
+  lock_mgr_->SetTxnMgr(this);
+}
+```
+
+### 13. 用测试逐个理解
+
+#### 13.1 SLockInReadUncommittedTest
+
+测试：
+
+```cpp
+Txn t{0, IsolationLevel::kReadUncommitted};
+lock_mgr_->LockShared(&t, r1);
+```
+
+期望：
+
+```text
+抛出 kLockSharedOnReadUncommitted
+事务状态变成 Aborted
+锁集合仍为空
+```
+
+核心检查点：
+
+```text
+Read Uncommitted 不能申请共享锁
+```
+
+#### 13.2 TwoPhaseLockingTest
+
+流程：
+
+```text
+T 获取 S(r0)
+T 获取 X(r1)
+T 释放 S(r0)，进入 Shrinking
+T 再申请 S(r0)，应 abort
+Abort(T)，释放剩余 X(r1)
+```
+
+这个测试验证：
+
+1. S 和 X 都能正常授予。
+2. Unlock 后事务进入 shrinking。
+3. shrinking 阶段不能再加锁。
+4. Abort 会释放事务剩余锁。
+
+#### 13.3 UpgradeLockInShrinkingPhase
+
+流程：
+
+```text
+T 获取 S(r)
+T 释放 S(r)，进入 Shrinking
+T 尝试 Upgrade(r)
+```
+
+期望：
+
+```text
+抛出 kLockOnShrinking
+事务状态 Aborted
+```
+
+说明 `LockUpgrade` 也必须走 `LockPrepare`。
+
+#### 13.4 UpgradeConflictTest
+
+流程：
+
+```text
+T0 获取 S(r)
+T1 获取 S(r)
+T0 尝试升级，等待 T1 释放
+T1 也尝试升级
+```
+
+期望：
+
+```text
+T1 因 kUpgradeConflict abort
+T1 Abort 后释放 S(r)
+T0 被唤醒并成功升级成 X(r)
+```
+
+这个测试验证：
+
+```text
+同一个 RowId 只能有一个升级者
+```
+
+#### 13.5 UpgradeTest
+
+流程：
+
+```text
+T 获取 S(r)
+T 升级为 X(r)
+T 释放 X(r)
+T commit
+```
+
+期望锁集合变化：
+
+```text
+拿 S 后：shared = 1, exclusive = 0
+升级后：shared = 0, exclusive = 1
+释放后：shared = 0, exclusive = 0
+```
+
+这能检查你有没有正确移动事务锁集合。
+
+#### 13.6 UpgradeAfterAbortTest
+
+流程：
+
+```text
+T0 获取 S(r)
+T1 获取 S(r)
+T0 尝试升级并阻塞
+另一个线程 Abort(T0)
+```
+
+期望：
+
+```text
+T0 的 LockUpgrade 被唤醒
+发现自己已经 Aborted
+抛出 kDeadlock
+T0 锁集合为空
+```
+
+这个测试会暴露一个常见错误：升级等待时过早把共享锁从事务集合中删掉，导致 Abort 无法释放锁并唤醒等待线程。
+
+#### 13.7 BasicCycleTest1
+
+手动添加边：
+
+```text
+0 -> 1
+1 -> 0
+```
+
+这是一个环：
+
+```text
+0 -> 1 -> 0
+```
+
+环中最大事务 id 是 1，所以：
+
+```cpp
+HasCycle(newest) == true
+newest == 1
+```
+
+删掉 `1 -> 0` 后就没有环。
+
+#### 13.8 BasicCycleTest2
+
+重点是 DFS 顺序。
+
+第一次应先发现：
+
+```text
+1 -> 2 -> 5 -> 1
+```
+
+所以 victim 是 5。
+
+删除 `5 -> 1` 后，再发现：
+
+```text
+0 -> 1 -> 3 -> 6 -> 0
+```
+
+所以 victim 是 6。
+
+如果你第一次返回 6，说明 DFS 起点或邻居遍历顺序不稳定。
+
+#### 13.9 DeadlockDetectionTest1
+
+流程：
+
+```text
+T0 获取 X(r0)
+T1 获取 X(r1)
+T0 请求 X(r1)，等待 T1
+T1 请求 X(r0)，等待 T0
+```
+
+等待图：
+
+```text
+T0 -> T1
+T1 -> T0
+```
+
+检测线程发现环，选择年轻事务 T1 abort。T1 catch 到 `kDeadlock` 后调用 `Abort` 释放 X(r1)，T0 被唤醒，拿到 X(r1)，最后 commit。
+
+#### 13.10 DeadlockDetectionTest2
+
+这个测试更复杂，目的是检查检测线程能连续处理多个环。
+
+初始：
+
+```text
+T0 持有 S(row0)
+T1 持有 S(row1)
+T2 持有 S(row2)
+T3 持有 S(row3)
+T2 额外持有 S(row1)
+```
+
+之后：
+
+```text
+T0 请求 X(row1)，等待 T1 和 T2
+T1 请求 X(row3)，等待 T3
+T2 请求 X(row0)，等待 T0
+T3 请求 X(row0)，等待 T0
+```
+
+可能形成两个环：
+
+```text
+T0 -> T2 -> T0
+T0 -> T1 -> T3 -> T0
+```
+
+检测线程应先后 abort T2 和 T3，让 T1、T0 最终能继续并 commit。
+
+### 14. 推荐实现顺序
+
+建议按这个顺序写：
+
+1. 实现 `AddEdge / RemoveEdge / GetEdgeList`。
+2. 实现 `HasCycle`，先通过 `BasicCycleTest1/2`。
+3. 实现 `LockPrepare`：
+   - shrinking 加锁 abort
+   - read uncommitted shared lock abort
+4. 实现 `Unlock` 的基本释放逻辑。
+5. 实现 `LockShared`，先支持无冲突和等待 writer。
+6. 实现 `LockExclusive`，支持等待所有 granted 锁释放。
+7. 实现 `LockUpgrade`，特别处理 `is_upgrading_`。
+8. 实现 `CheckAbort`，等待线程醒来后能抛 `kDeadlock`。
+9. 在等待时维护 waits-for graph。
+10. 实现 `RunCycleDetection`。
+11. 跑完整 lock manager 测试。
+
+测试命令：
+
+```bash
+make lock_manager_test -j
+./test/lock_manager_test
+```
+
+如果某个并发测试卡住，优先怀疑：
+
+```text
+cv_.notify_all() 没调用
+事务 abort 后等待线程没检查状态
+升级等待时共享锁集合处理错
+死锁检测只 abort 但没唤醒等待队列
+```
+
+### 15. 常见错误清单
+
+1. Read Uncommitted 下允许申请共享锁，导致 `SLockInReadUncommittedTest` 失败。
+2. Unlock 后没有把事务从 growing 改为 shrinking。
+3. Shrinking 阶段仍允许加锁，没有抛 `kLockOnShrinking`。
+4. 加锁成功后只改了请求队列，没更新事务的 shared/exclusive lock set。
+5. Unlock 只改事务 lock set，没更新 `sharing_cnt_` 或 `is_writing_`。
+6. 排他锁等待条件写成只检查 `is_writing_`，忘了检查 `sharing_cnt_`。
+7. 共享锁等待条件写错，导致多个读事务互相阻塞。
+8. 锁升级时允许两个事务同时升级，没有用 `is_upgrading_`。
+9. 第二个升级者没有抛 `kUpgradeConflict`。
+10. 升级成功后忘记把 shared lock set 中的 rid 移到 exclusive lock set。
+11. 升级等待时过早删除自己的共享锁，导致 abort 无法释放并唤醒。
+12. 等待时没有添加 waits-for edge，死锁检测看不到环。
+13. 锁授予或释放后没有删除旧等待边，导致图中残留假死锁。
+14. `HasCycle` 使用 unordered_map 原始遍历顺序，返回 victim 不稳定。
+15. `HasCycle` 找到环后返回的是最后访问节点，而不是环中最大 txn_id。
+16. 死锁检测只检测一次，没有循环处理多个环。
+17. 检测线程设置事务 aborted 后没有唤醒 condition variable，等待线程永远睡眠。
+18. 等待线程醒来后不检查事务是否 aborted。
+19. `TxnManager::Abort` 释放锁时，`Unlock` 把事务状态从 aborted 改回 shrinking。
+20. 持有全局 latch 时调用可能再次加锁的复杂逻辑，造成自锁或长时间阻塞。
+
+### 16. 验收问答准备
+
+问题：共享锁和排他锁有什么区别？
+
+回答要点：共享锁用于读，多个事务可以同时持有；排他锁用于写，同一时刻只能一个事务持有，并且不能和任何共享锁共存。
+
+问题：什么是 2PL？
+
+回答要点：两阶段封锁把事务分成 growing 和 shrinking 两个阶段。Growing 阶段可以加锁，Shrinking 阶段只能释放锁不能再加锁。遵守 2PL 可以保证冲突可串行化。
+
+问题：为什么 Read Uncommitted 不能申请共享锁？
+
+回答要点：Read Uncommitted 允许脏读，读操作不通过共享锁保护。如果它申请共享锁，就不符合该隔离级别语义，所以测试要求直接 abort。
+
+问题：锁升级为什么需要 `is_upgrading_`？
+
+回答要点：如果多个持有共享锁的事务同时升级，它们会互相等待对方释放共享锁，容易形成升级死锁。`is_upgrading_` 限制同一记录上只有一个升级者，第二个升级者直接 abort。
+
+问题：为什么事务释放锁后不能再加锁？
+
+回答要点：这是 2PL 的要求。释放第一把锁表示进入 shrinking 阶段，如果之后还能加锁，就可能破坏冲突可串行化。
+
+问题：等待图中的边是什么意思？
+
+回答要点：边 `Ti -> Tj` 表示事务 Ti 正在等待事务 Tj 释放某个冲突锁。等待图中出现环就说明存在死锁。
+
+问题：死锁检测为什么选择环中最大的 txn_id abort？
+
+回答要点：通常 txn_id 越大代表事务越年轻，已经做的工作更少，abort 它的代价较低。本实验也明确要求返回环中最大的事务 id。
+
+问题：为什么检测线程只设置 aborted 并唤醒等待者？
+
+回答要点：检测线程发现 victim 后把事务状态改为 aborted，等待该锁的线程醒来后检查状态并抛异常，然后事务管理器走 abort 流程释放锁。这样职责更清晰。
+
+问题：`condition_variable` 在这里的作用是什么？
+
+回答要点：当锁暂时不能授予时，事务线程阻塞等待。其他事务 unlock 或死锁检测 abort victim 后，通过 `notify_all` 唤醒等待线程重新检查条件。
+
+问题：为什么 `HasCycle` 要用确定的遍历顺序？
+
+回答要点：测试要求返回“第一个发现的环”中的最大事务 id。如果 unordered_map 遍历顺序不稳定，可能先发现另一个环，导致 victim 和测试期望不一致。
+
+### 17. 本实验完成标准
+
+完成实验七后，你应该能做到：
+
+1. 正确授予和释放共享锁、排他锁。
+2. 正确维护事务的 shared/exclusive lock set。
+3. 遵守 2PL 状态转换。
+4. 正确处理 Read Uncommitted 共享锁异常。
+5. 正确完成共享锁到排他锁的升级。
+6. 正确处理升级冲突。
+7. 正确维护 waits-for graph。
+8. 正确检测环并返回环中最大事务 id。
+9. 后台死锁检测能 abort victim 并唤醒等待线程。
+10. `lock_manager_test` 全部通过。
+
+到这里，MiniSQL 七个核心实验就形成闭环了：底层页管理负责存储，Record 管表记录，Index 管查找加速，Catalog 管元信息，Executor 执行 SQL，Recovery 保证崩溃后一致，Lock Manager 保证并发事务之间的隔离。
+
+## 附录：测试代码设计指导
+
+### 1. 测试目标
+
+MiniSQL 的实验不是“写完代码能编译”就结束，而是要用测试证明每个模块满足接口契约。你写测试时要围绕三个问题：
+
+1. 正常路径是否正确：常见输入能得到期望输出。
+2. 边界条件是否正确：空表、满页、重复键、删除不存在对象、缓冲池满、锁冲突等场景是否稳定。
+3. 模块协作是否正确：表、索引、Catalog、Executor、Recovery、Lock Manager 串起来后是否仍然一致。
+
+现有项目使用 GoogleTest。测试目录结构是：
+
+```text
+test/
+  buffer/
+  catalog/
+  concurrency/
+  execution/
+  index/
+  page/
+  record/
+  recovery/
+  storage/
+```
+
+`test/CMakeLists.txt` 会自动收集：
+
+```cmake
+test/*/*test.cpp
+```
+
+也就是说，你新增测试文件时只要满足：
+
+```text
+test/某模块/xxx_test.cpp
+```
+
+重新执行一次 `cmake ..` 后，就会生成对应测试目标：
+
+```bash
+make xxx_test -j
+./test/xxx_test
+```
+
+同时总测试目标是：
+
+```bash
+make minisql_test -j
+./test/minisql_test
+```
+
+如果只想跑某一个 GoogleTest 用例，可以使用 filter：
+
+```bash
+./test/minisql_test --gtest_filter=LockManagerTest.BasicCycleTest2
+```
+
+### 2. 测试代码基本格式
+
+简单测试用 `TEST`：
+
+```cpp
+#include "gtest/gtest.h"
+
+TEST(ModuleNameTest, CaseName) {
+  // Arrange: 准备对象和输入
+  // Act: 调用被测接口
+  // Assert: 检查结果
+}
+```
+
+需要复用初始化和清理逻辑时，用 `TEST_F`：
+
+```cpp
+class MyModuleTest : public ::testing::Test {
+ protected:
+  void SetUp() override {
+    // 每个测试开始前执行
+  }
+
+  void TearDown() override {
+    // 每个测试结束后执行
+  }
+};
+
+TEST_F(MyModuleTest, CaseName) {
+  // 可以直接使用 fixture 中的成员
+}
+```
+
+现有 `ExecutorTest` 就是一个典型 fixture。它在 `SetUp` 中创建测试数据库、建表、插入 1000 行，再给每个 executor 测试复用。
+
+### 3. ASSERT 和 EXPECT 怎么选
+
+GoogleTest 中：
+
+- `ASSERT_*` 失败后，当前测试立即停止。
+- `EXPECT_*` 失败后，继续执行后续检查。
+
+推荐原则：
+
+```text
+如果后续代码依赖这个条件成立，用 ASSERT。
+如果只是多个独立结果的检查，用 EXPECT。
+```
+
+例如：
+
+```cpp
+auto *page = bpm->NewPage(page_id);
+ASSERT_NE(nullptr, page);
+EXPECT_EQ(0, page_id);
+```
+
+如果 page 是空指针，后面继续访问会崩溃，所以先用 `ASSERT_NE`。
+
+### 4. 测试设计层次
+
+MiniSQL 的测试建议分四层写。
+
+#### 4.1 纯单元测试
+
+只测一个小类，不依赖磁盘和其他模块。
+
+适合：
+
+- `BitmapPage`
+- `LRUReplacer`
+- `Field / Row / Column / Schema` 序列化
+- `LogRec`
+- `Waits-for Graph`
+
+特点：
+
+```text
+速度快
+定位准
+失败后容易判断是哪一个函数错了
+```
+
+例子：
+
+```text
+BitmapPage:
+  初始全空闲
+  连续分配不重复
+  分配满后返回 false
+  释放后能重新分配同一 offset
+```
+
+#### 4.2 存储层测试
+
+会创建临时数据库文件，测试磁盘页、缓冲池、表堆。
+
+适合：
+
+- `DiskManager`
+- `BufferPoolManager`
+- `TableHeap`
+
+特点：
+
+```text
+需要 remove 临时 db 文件
+需要检查刷盘和重新读取
+需要小心 pin/unpin
+```
+
+推荐每个测试使用独立文件名：
+
+```cpp
+const std::string db_name = "my_module_case_test.db";
+remove(db_name.c_str());
+...
+remove(db_name.c_str());
+```
+
+这样可以避免旧测试文件污染新测试。
+
+#### 4.3 集成测试
+
+把多个模块连起来测。
+
+适合：
+
+- Catalog 创建表后重启再加载
+- 创建索引后插入记录再查索引
+- Executor 执行 insert/delete/update 后检查表和索引
+
+特点：
+
+```text
+更接近真实数据库行为
+失败定位范围更大
+需要先保证底层单测通过
+```
+
+集成测试最好写成“短链路”：
+
+```text
+建库 -> 建表 -> 插入少量数据 -> 创建索引 -> 查询 -> 删除 -> 再查询
+```
+
+不要一上来写一个包含所有 SQL 的大测试。大测试失败时很难知道到底是哪一步错。
+
+#### 4.4 并发测试
+
+测试锁、死锁和线程等待。
+
+适合：
+
+- `LockManager`
+- 未来如果扩展事务执行，也可以测并发读写。
+
+特点：
+
+```text
+容易卡住
+容易不稳定
+必须让线程执行顺序尽量可控
+```
+
+可以使用：
+
+```cpp
+std::this_thread::sleep_for(std::chrono::milliseconds(100));
+```
+
+让一个线程先进入阻塞状态，再启动另一个线程。但不要把 sleep 写得太短，否则不同机器上可能偶发失败。
+
+### 5. 每个实验建议补充哪些测试
+
+#### 5.1 实验一：Disk and Buffer Pool Manager
+
+`BitmapPage` 建议测试：
+
+- 初始状态所有 bit 都是 free。
+- 连续分配直到满，返回 offset 不重复。
+- 满后继续分配返回 false。
+- 释放一个 offset 后，下一次能重新分配到它。
+- 重复释放同一 offset，第二次返回 false。
+- 释放越界 offset，返回 false。
+
+`DiskManager` 建议测试：
+
+- 逻辑页号从 0 开始连续分配。
+- 跨 extent 后 `num_extents_` 增加。
+- `MapPageId` 在 extent 边界处正确。
+- `DeAllocatePage` 后 meta page 的 allocated count 和 extent used count 正确减少。
+- 关闭并重新打开数据库文件后，meta 信息仍然存在。
+
+`LRUReplacer` 建议测试：
+
+- `Unpin` 后 frame 进入可淘汰集合。
+- 重复 `Unpin` 不增加 size。
+- `Victim` 按 LRU 顺序返回。
+- `Pin` 后 frame 不再能被 victim。
+- 空集合时 `Victim` 返回 false。
+
+`BufferPoolManager` 建议测试：
+
+- `NewPage` 分配 page id 并 pin。
+- buffer pool 满且所有页 pinned 时，继续 `NewPage` 返回 nullptr。
+- `UnpinPage` 后页可被淘汰。
+- dirty page 淘汰前会刷盘。
+- `FetchPage` 读取已写入的数据。
+- `DeletePage` 对 pinned page 应失败，对 unpinned page 应成功。
+
+#### 5.2 实验二：Record Manager
+
+`Field / Column / Schema` 建议测试：
+
+- int、float、char 的序列化和反序列化。
+- char 空串、最大长度、含 `\0` 的情况。
+- nullable 字段和 null bitmap。
+- schema 中列名、列类型、列下标保持一致。
+
+`Row` 建议测试：
+
+- 多列 row 序列化后能完整恢复。
+- row 的 deep copy 不共享 Field 指针。
+- `GetKeyFromRow` 能按 key schema 取出正确列。
+
+`TableHeap` 建议测试：
+
+- 插入大量记录后 RowId 不重复。
+- 根据 RowId 能取回原记录。
+- 一页放不下时自动创建下一页。
+- `Begin/End` 迭代器能遍历所有未删除记录。
+- `MarkDelete` 后迭代器和 `GetTuple` 都看不到记录。
+- `RollbackDelete` 能恢复逻辑删除。
+- `ApplyDelete` 后 slot 可复用。
+- `UpdateTuple` 修改记录后旧值消失、新值可读。
+
+#### 5.3 实验三：Index Manager
+
+B+ 树建议测试：
+
+- 空树查找返回 false。
+- 单个 key 插入后可查。
+- 顺序插入触发 leaf split。
+- 随机插入触发多层 internal split。
+- 删除触发 borrow 或 merge。
+- 删除到只剩少量 key 时 root 调整正确。
+- 删除不存在 key 不破坏树。
+- 重复 key 的行为符合项目要求。
+- `Check()` 在每轮插入/删除后都通过。
+
+索引迭代器建议测试：
+
+- 从最小 key 开始顺序遍历。
+- 跨 leaf page 继续遍历。
+- 到末尾后等于 `End()`。
+- 删除一部分 key 后迭代器只遍历剩余 key。
+
+BPlusTreeIndex 建议测试：
+
+- `InsertEntry / ScanKey / RemoveEntry` 能正确转发到底层 B+ 树。
+- 使用复合 key 时 key_map 顺序正确。
+- 重启数据库后索引 root page 能通过 `IndexRootsPage` 恢复。
+
+#### 5.4 实验四：Catalog Manager
+
+Catalog 建议测试：
+
+- `CatalogMeta` 序列化后 table/index meta page 映射完全一致。
+- 创建表后能按表名获取 `TableInfo`。
+- 重复创建同名表返回 `DB_TABLE_ALREADY_EXIST`。
+- 删除不存在表返回 `DB_TABLE_NOT_EXIST`。
+- 关闭数据库再打开，表 schema 和 first page id 仍然正确。
+- 创建索引时列名不存在返回 `DB_COLUMN_NAME_NOT_EXIST`。
+- 重复创建同名索引返回 `DB_INDEX_ALREADY_EXIST`。
+- `GetTableIndexes` 能返回该表所有索引。
+- 删除索引后 `GetIndex` 返回不存在。
+- 如果表中已有数据，创建索引后应能查到旧数据。
+
+#### 5.5 实验五：Planner and Executor
+
+Executor 建议测试：
+
+- SeqScan 无 predicate 时返回全表。
+- SeqScan 有 predicate 时只返回满足条件的行。
+- SeqScan 投影列顺序正确，例如 `select name, id`。
+- IndexScan 单列等值查找正确。
+- IndexScan 多个 AND 条件能取交集。
+- IndexScan 有 residual predicate 时能二次过滤。
+- Insert 能写入 TableHeap 并更新所有索引。
+- Insert 违反唯一索引时失败。
+- Delete 后顺序扫描和索引扫描都找不到记录。
+- Update 普通列后能读到新值。
+- Update 索引列后旧 key 查不到，新 key 查得到。
+
+ExecuteEngine 建议测试：
+
+- `create database / use database / drop database` 状态正确。
+- `create table` 能解析 int、float、char(n)、unique、primary key。
+- `drop table` 会删除表和相关索引。
+- `create index` 后能通过索引查询。
+- `drop index` 语法没有表名时仍能找到并删除索引。
+- `show tables / show indexes` 不崩溃，输出信息合理。
+- `execfile` 能执行多行 SQL 文件。
+- `quit` 返回 `DB_QUIT`。
+
+#### 5.6 实验六：Recovery Manager
+
+日志建议测试：
+
+- 每条日志的 LSN 连续递增。
+- 同一事务的 `prev_lsn_` 串成正确链。
+- 不同事务的第一条日志 `prev_lsn_` 是 `INVALID_LSN`。
+- insert/delete/update 日志保存足够 Redo/Undo 的 old/new key/value。
+
+Recovery 建议测试：
+
+- checkpoint 初始化后 data 和 active transaction table 正确。
+- Redo 能重做 insert。
+- Redo 能重做 delete。
+- Redo 能重做 update。
+- Commit 事务不进入 Undo。
+- Abort 事务在恢复中被撤销。
+- 崩溃时仍 active 的事务在 UndoPhase 中被撤销。
+- update 改变 key 时，Redo 和 Undo 都正确处理 old key / new key。
+- Redo 重复执行不会破坏最终状态，也就是尽量保持幂等。
+
+#### 5.7 实验七：Lock Manager
+
+锁兼容性建议测试：
+
+- 多个事务可同时持有同一 RowId 的共享锁。
+- 有共享锁时，其他事务申请排他锁会阻塞。
+- 有排他锁时，其他事务申请共享锁会阻塞。
+- 排他锁释放后等待者能被唤醒。
+
+2PL 建议测试：
+
+- growing 阶段能加锁。
+- unlock 后进入 shrinking。
+- shrinking 阶段再加锁抛 `kLockOnShrinking`。
+- commit/abort 后释放所有锁。
+
+锁升级建议测试：
+
+- 单事务 S -> X 成功。
+- 两个事务同时升级时，第二个抛 `kUpgradeConflict`。
+- 升级等待期间被 abort 时，等待线程能醒来并抛异常。
+
+死锁检测建议测试：
+
+- 手动等待图无环返回 false。
+- 简单二元环返回 true，并选择最大 txn id。
+- 多个环时按确定 DFS 顺序返回第一个环的最大 txn id。
+- 后台检测线程能 abort victim。
+- victim abort 后其他事务能继续拿锁并提交。
+
+### 6. 测试数据设计方法
+
+#### 6.1 小规模精确用例
+
+先用小数据验证边界：
+
+```text
+0 条记录
+1 条记录
+2 条记录
+刚好填满 1 页
+刚好触发 split / merge
+```
+
+这类测试最适合定位 bug。例如 B+ 树 split 错，通常小规模边界比 2000 条随机插入更容易看清。
+
+#### 6.2 大规模压力用例
+
+再用较大数据验证稳定性：
+
+```text
+插入 1000 / 10000 条记录
+随机插入
+随机删除一半
+随机查询所有剩余 key
+```
+
+压力测试要配一个 oracle，也就是标准答案。常用结构：
+
+```cpp
+std::unordered_map<int64_t, Fields *> expected;
+std::map<GenericKey *, RowId> kv_map;
+```
+
+测试时不要只检查“不崩溃”，要检查每个 key 对应的值是否正确。
+
+#### 6.3 随机测试要可解释
+
+现有测试里使用了 `RandomUtils` 和 `ShuffleArray`。随机测试很有用，但失败后不容易复现。
+
+如果你自己写更复杂的随机测试，建议使用固定 seed：
+
+```cpp
+std::mt19937 rng(15445);
+```
+
+这样失败时可以重复跑出同样顺序。
+
+### 7. 临时文件和资源清理
+
+涉及磁盘文件的测试一定要清理：
+
+```cpp
+const std::string db_name = "my_test.db";
+remove(db_name.c_str());
+
+auto *disk_manager = new DiskManager(db_name);
+auto *bpm = new BufferPoolManager(10, disk_manager);
+
+...
+
+disk_manager->Close();
+delete bpm;
+delete disk_manager;
+remove(db_name.c_str());
+```
+
+如果用 `DBStorageEngine`：
+
+```cpp
+remove("my_engine_test.db");
+auto *engine = new DBStorageEngine("my_engine_test.db", true);
+...
+delete engine;
+remove("my_engine_test.db");
+```
+
+清理顺序要注意：
+
+```text
+先 delete 使用文件的对象
+再 remove 文件
+```
+
+否则 Windows 或 WSL 环境中可能出现文件仍被占用的问题。
+
+### 8. 如何定位失败
+
+测试失败时按这个顺序排查：
+
+1. 看第一个失败的 ASSERT，不要先看后面一串连锁失败。
+2. 确认失败是单测还是集成测试。
+3. 如果集成测试失败，先跑依赖模块单测。
+4. 对涉及磁盘的测试，确认测试开始前删除了旧 db 文件。
+5. 对涉及 BufferPool 的测试，检查每次 Fetch/New 后是否 Unpin。
+6. 对涉及 B+ 树的测试，插入/删除后调用 `Check()`。
+7. 对涉及 Executor 的测试，同时检查 TableHeap 和 Index 是否一致。
+8. 对涉及并发的测试，检查等待条件、notify、abort 状态和线程 join。
+
+常用命令：
+
+```bash
+make buffer_pool_manager_test -j
+./test/buffer_pool_manager_test
+
+make lock_manager_test -j
+./test/lock_manager_test --gtest_filter=LockManagerTest.DeadlockDetectionTest1
+
+make minisql_test -j
+./test/minisql_test --gtest_filter=BPlusTreeTests.*
+```
+
+### 9. 自己新增测试文件的建议命名
+
+如果你想保留官方测试不动，同时加自己的测试，推荐：
+
+```text
+test/storage/disk_manager_extra_test.cpp
+test/buffer/buffer_pool_manager_extra_test.cpp
+test/index/b_plus_tree_extra_test.cpp
+test/execution/executor_sql_extra_test.cpp
+test/concurrency/lock_manager_extra_test.cpp
+```
+
+新增后重新配置：
+
+```bash
+cd build
+cmake ..
+make disk_manager_extra_test -j
+./test/disk_manager_extra_test
+```
+
+不要直接把所有个人测试都塞进一个巨大文件。按模块拆开，可以更快定位问题。
+
+### 10. 测试代码风格建议
+
+1. 一个测试只验证一个核心行为。
+2. 测试名要表达场景，例如 `EvictDirtyPageShouldFlush`。
+3. Arrange / Act / Assert 三段逻辑保持清晰。
+4. 不要依赖测试执行顺序，每个测试都要能独立运行。
+5. 临时文件名尽量唯一。
+6. 并发测试必须 join 所有线程。
+7. 不要让测试无限等待，必要时加合理 sleep 和检测开关。
+8. 对随机测试保存 expected map，不要凭直觉判断。
+9. 对错误路径也要测，例如重复创建、删除不存在对象、锁冲突。
+10. 官方测试不要随意改断言。需要调试时可以临时加日志，最终应恢复干净。
+
+### 11. 验收时如何展示测试设计
+
+老师如果问“你怎么保证这个模块正确”，不要只说“我跑了测试”。更好的回答结构是：
+
+```text
+我按三层测：
+1. 单元测试覆盖核心数据结构和边界条件。
+2. 持久化测试覆盖关闭再打开后的状态恢复。
+3. 集成测试覆盖和上下游模块的协作。
+```
+
+例如 Buffer Pool 可以这样回答：
+
+```text
+我先测 NewPage / FetchPage / UnpinPage / DeletePage 的基本行为；
+再测所有页 pinned 时无法淘汰；
+然后写入 binary data，unpin dirty page，触发淘汰后重新 Fetch，验证数据没有丢。
+```
+
+例如 Lock Manager 可以这样回答：
+
+```text
+我先测 S/X 兼容性和 2PL 状态转换；
+再测锁升级冲突；
+最后构造等待图环和真实多线程死锁，验证后台检测能 abort 年轻事务并唤醒其他事务。
+```
+
+这样的回答会让老师看到你理解的是“正确性条件”，不是只记住了测试命令。
+
+### 12. 最终测试路线
+
+建议实现源码时按这个顺序跑测试：
+
+```bash
+make disk_manager_test -j
+./test/disk_manager_test
+
+make lru_replacer_test -j
+./test/lru_replacer_test
+
+make buffer_pool_manager_test -j
+./test/buffer_pool_manager_test
+
+make tuple_test -j
+./test/tuple_test
+
+make table_heap_test -j
+./test/table_heap_test
+
+make b_plus_tree_test -j
+./test/b_plus_tree_test
+
+make b_plus_tree_index_test -j
+./test/b_plus_tree_index_test
+
+make index_iterator_test -j
+./test/index_iterator_test
+
+make catalog_test -j
+./test/catalog_test
+
+make executor_test -j
+./test/executor_test
+
+make recovery_manager_test -j
+./test/recovery_manager_test
+
+make lock_manager_test -j
+./test/lock_manager_test
+```
+
+所有单项通过后，再跑总测试：
+
+```bash
+make minisql_test -j
+./test/minisql_test
+```
+
+最终目标不是“某一次跑通”，而是每次从干净构建目录开始都能稳定通过。稳定通过，才说明你的实现没有依赖旧文件、测试顺序或偶然的线程调度。
