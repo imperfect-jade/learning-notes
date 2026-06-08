@@ -76,6 +76,7 @@
 | 已讲解 | 7.3 锁升级、等待队列与事务状态 | 见“实验七” |
 | 已讲解 | 7.4 等待图与死锁检测 | 见“实验七” |
 | 已追加 | 附录：测试代码设计指导 | 见“测试代码设计指导” |
+| 已追加 | Bonus：Clock Replacer 与堆表优化 | 见“Bonus 实验指导” |
 
 ## 下一步
 
@@ -7882,3 +7883,920 @@ make minisql_test -j
 ```
 
 最终目标不是“某一次跑通”，而是每次从干净构建目录开始都能稳定通过。稳定通过，才说明你的实现没有依赖旧文件、测试顺序或偶然的线程调度。
+
+## Bonus 实验指导：Clock Replacer 与堆表优化
+
+### 1. Bonus 总目标
+
+Bonus 分成两个方向：
+
+1. 在已有 `LRUReplacer` 之外，实现一种新的缓冲区替换算法，例如 `ClockReplacer`，并为它设计测试用例证明正确性。
+2. 优化 `TableHeap` 和 `TablePage` 的实现，通过额外元信息减少插入、查找、删除时的扫描成本。
+
+这两个 Bonus 都和数据库性能有关。前者优化的是缓冲池淘汰策略，影响“内存不够时换出哪一页”；后者优化的是表页和堆表内部组织，影响“插入一条记录时去哪一页、找下一条记录时扫多少 slot、删除后空间如何复用”。
+
+注意：Bonus 不建议一开始就改太大。应该先保证实验一到实验五基础功能正确，再做增强。实现时要尽量保持原有接口兼容，不要破坏官方测试。
+
+对应已有文件：
+
+- `src/include/buffer/replacer.h`
+- `src/include/buffer/lru_replacer.h`
+- `src/buffer/lru_replacer.cpp`
+- `src/include/buffer/buffer_pool_manager.h`
+- `src/buffer/buffer_pool_manager.cpp`
+- `src/include/page/table_page.h`
+- `src/page/table_page.cpp`
+- `src/include/storage/table_heap.h`
+- `src/storage/table_heap.cpp`
+- `test/buffer/lru_replacer_test.cpp`
+- `test/storage/table_heap_test.cpp`
+
+建议新增文件：
+
+- `src/include/buffer/clock_replacer.h`
+- `src/buffer/clock_replacer.cpp`
+- `test/buffer/clock_replacer_test.cpp`
+- 可选：`test/storage/table_heap_optimized_test.cpp`
+
+### 2. Bonus 一：Clock Replacer
+
+#### 2.1 数据库知识：为什么需要替换算法
+
+数据库缓冲池大小有限，不可能把所有磁盘页都放进内存。当缓冲池满了，又需要读入新页时，就必须淘汰一个当前不被使用的页。
+
+替换算法要解决的问题是：
+
+```text
+在所有 pin_count == 0 的页面中，应该淘汰哪一个？
+```
+
+LRU 的思想是淘汰“最近最少使用”的页。它比较直观，但通常需要维护链表和哈希表。Clock 算法可以看作 LRU 的近似实现，它使用一个环形指针和引用位，开销更低，实现也适合缓冲池。
+
+#### 2.2 Clock 算法直觉
+
+Clock Replacer 把所有 frame 想象成一个环：
+
+```text
+       hand
+        |
+        v
+   [0] [1] [2] [3] [4] [5]
+    ^                       |
+    |_______________________|
+```
+
+每个 frame 有一个 reference bit：
+
+- `ref = 1`：最近被访问过，先给它一次机会。
+- `ref = 0`：没有最近访问记录，可以淘汰。
+
+Victim 时，时钟指针从当前位置开始扫描：
+
+1. 如果当前 frame 不在 replacer 中，跳过。
+2. 如果当前 frame 在 replacer 中且 `ref = 1`，把它改成 `0`，给第二次机会，然后指针前进。
+3. 如果当前 frame 在 replacer 中且 `ref = 0`，选择它作为 victim，移出 replacer，指针前进。
+
+所以 Clock 也叫 Second-Chance Algorithm，第二次机会算法。
+
+#### 2.3 Replacer 接口语义
+
+Clock Replacer 应该继承已有抽象类：
+
+```cpp
+class Replacer {
+ public:
+  virtual bool Victim(frame_id_t *frame_id) = 0;
+  virtual void Pin(frame_id_t frame_id) = 0;
+  virtual void Unpin(frame_id_t frame_id) = 0;
+  virtual size_t Size() = 0;
+};
+```
+
+这四个接口的语义必须和 LRU 一致：
+
+- `Unpin(frame_id)`：该 frame 当前没人使用，可以成为淘汰候选。
+- `Pin(frame_id)`：该 frame 正在被使用，不能被淘汰，应从 replacer 中移除。
+- `Victim(frame_id)`：从候选集合中选择一个 frame 淘汰。
+- `Size()`：返回当前可被淘汰的 frame 数量。
+
+注意：这里的 `Pin` 和 `Unpin` 是 Replacer 层面的通知，不是直接修改 `Page::pin_count_`。真正的 `pin_count_` 由 `BufferPoolManager` 维护。
+
+#### 2.4 推荐数据结构
+
+建议新增 `ClockReplacer` 类：
+
+```cpp
+class ClockReplacer : public Replacer {
+ public:
+  explicit ClockReplacer(size_t num_pages);
+  ~ClockReplacer() override;
+
+  bool Victim(frame_id_t *frame_id) override;
+  void Pin(frame_id_t frame_id) override;
+  void Unpin(frame_id_t frame_id) override;
+  size_t Size() override;
+
+ private:
+  struct FrameState {
+    bool in_replacer_{false};
+    bool ref_{false};
+  };
+
+  std::vector<FrameState> frames_;
+  size_t hand_{0};
+  size_t size_{0};
+  std::mutex latch_;
+};
+```
+
+字段含义：
+
+- `frames_[i].in_replacer_`：frame i 是否当前可被淘汰。
+- `frames_[i].ref_`：frame i 是否有第二次机会。
+- `hand_`：时钟指针当前位置。
+- `size_`：当前在 replacer 中的 frame 数。
+- `latch_`：保证多线程访问安全。
+
+为什么用 `vector`？
+
+因为 frame id 的范围是 `[0, pool_size)`，可以直接用下标访问，速度快，也比链表更适合 Clock。
+
+#### 2.5 Unpin 实现指导
+
+`Unpin(frame_id)` 表示该 frame 现在可以被淘汰。
+
+推荐逻辑：
+
+```text
+1. 如果 frame_id 越界，直接返回。
+2. 加锁。
+3. 如果该 frame 不在 replacer 中：
+   - in_replacer = true
+   - ref = true
+   - size++
+4. 如果已经在 replacer 中：
+   - 不增加 size
+   - 可以把 ref 重新设为 true，表示最近又被访问过
+5. 解锁。
+```
+
+重复 `Unpin` 不能让 `Size()` 增加。这个点和 LRU 测试中的重复 `Unpin(1)` 类似。
+
+是否要在重复 Unpin 时刷新 `ref`？
+
+推荐刷新为 `true`。因为 Clock 中 reference bit 表示近期访问过，再次 unpin 可以理解为“这个 frame 刚完成一次使用”，应获得第二次机会。
+
+#### 2.6 Pin 实现指导
+
+`Pin(frame_id)` 表示该 frame 正在被使用，不能被淘汰。
+
+推荐逻辑：
+
+```text
+1. 如果 frame_id 越界，直接返回。
+2. 加锁。
+3. 如果该 frame 在 replacer 中：
+   - in_replacer = false
+   - ref = false
+   - size--
+4. 如果不在 replacer 中，不做事。
+5. 解锁。
+```
+
+注意：如果 `hand_` 正好指向被 pin 的 frame，不需要特殊移动。后续 `Victim` 扫到它时会发现 `in_replacer = false`，自然跳过。
+
+#### 2.7 Victim 实现指导
+
+`Victim(frame_id)` 是 Clock 的核心。
+
+推荐逻辑：
+
+```text
+1. 加锁。
+2. 如果 size == 0，返回 false。
+3. 循环扫描：
+   - 如果 frames_[hand] 不在 replacer 中：
+       hand = (hand + 1) % capacity
+       continue
+   - 如果 ref == true：
+       ref = false
+       hand = (hand + 1) % capacity
+       continue
+   - 如果 ref == false：
+       *frame_id = hand
+       in_replacer = false
+       size--
+       hand = (hand + 1) % capacity
+       return true
+```
+
+因为 `size > 0`，理论上一定能找到 victim。最坏情况下会先把所有候选 frame 的 ref 从 1 清为 0，再第二圈找到第一个 ref 为 0 的 frame。
+
+示例：
+
+```text
+初始：0,1,2 都在 replacer，ref 都为 1，hand = 0
+
+Victim:
+  看 0，ref=1 -> 清 0
+  看 1，ref=1 -> 清 0
+  看 2，ref=1 -> 清 0
+  再看 0，ref=0 -> 淘汰 0
+```
+
+这正是“给第二次机会”的含义。
+
+#### 2.8 Size 实现指导
+
+`Size()` 返回当前可淘汰 frame 数量：
+
+```cpp
+return size_;
+```
+
+如果考虑线程安全，读取时也加锁。
+
+#### 2.9 如何接入 BufferPoolManager
+
+最简单的 Bonus 证明方式是：
+
+```text
+只实现 ClockReplacer 并单独测试
+```
+
+因为 Bonus 要求是“除 LRU Replacer 外，实现一种新的缓冲区替换算法，并实现测试用例”。不一定必须替换 BufferPoolManager 默认算法。
+
+如果你希望让 BufferPoolManager 也能使用 Clock，有两种做法。
+
+第一种：临时替换。
+
+```cpp
+replacer_ = new ClockReplacer(pool_size_);
+```
+
+这会让所有缓冲池测试都走 Clock。缺点是改变了默认行为，调试 LRU 时不方便。
+
+第二种：增加策略参数。
+
+```cpp
+enum class ReplacerType { LRU, CLOCK };
+
+BufferPoolManager(size_t pool_size,
+                  DiskManager *disk_manager,
+                  ReplacerType type = ReplacerType::LRU);
+```
+
+构造函数中：
+
+```text
+if type == LRU:
+  replacer_ = new LRUReplacer(pool_size_)
+else:
+  replacer_ = new ClockReplacer(pool_size_)
+```
+
+这种方式更清晰，但会修改 `BufferPoolManager` 构造函数签名。为了不影响官方测试，应给参数设置默认值。
+
+#### 2.10 Clock Replacer 测试设计
+
+建议新增：
+
+```text
+test/buffer/clock_replacer_test.cpp
+```
+
+测试目标：
+
+1. `Unpin` 会加入候选集合。
+2. 重复 `Unpin` 不增加 size。
+3. `Pin` 会移除候选 frame。
+4. `Victim` 会按 Clock 规则给 ref=1 的 frame 第二次机会。
+5. 所有 frame 都 pinned 时，`Victim` 返回 false。
+6. hand 能正确环形移动。
+
+推荐测试 1：基础加入和删除。
+
+```text
+ClockReplacer replacer(4)
+Unpin(0), Unpin(1), Unpin(2)
+Size == 3
+Pin(1)
+Size == 2
+Victim 应最终返回 0 或 2，且不会返回 1
+```
+
+推荐测试 2：重复 Unpin。
+
+```text
+Unpin(1)
+Unpin(1)
+Size == 1
+Victim 返回 1
+Size == 0
+```
+
+推荐测试 3：第二次机会。
+
+可以构造更确定的序列：
+
+```text
+ClockReplacer replacer(3)
+Unpin(0), Unpin(1), Unpin(2)
+
+Victim:
+  第一圈清掉 0,1,2 的 ref
+  第二圈淘汰 0
+
+Unpin(0)
+Pin(1)
+
+Victim:
+  hand 此时大概率在 1
+  1 不在 replacer，跳过
+  2 ref=0，淘汰 2
+```
+
+预期：
+
+```text
+第一次 victim = 0
+第二次 victim = 2
+```
+
+推荐测试 4：全部 pinned。
+
+```text
+ClockReplacer replacer(2)
+Unpin(0)
+Pin(0)
+Victim 返回 false
+Size == 0
+```
+
+推荐测试 5：和 BufferPoolManager 集成。
+
+如果你把 Clock 接入 BPM，可以设计：
+
+```text
+pool_size = 3
+NewPage 三次，占满缓冲池
+Unpin 0,1,2
+FetchPage(0) 再 Unpin，让 0 ref 变为 true
+NewPage 触发淘汰
+检查被淘汰页符合 Clock 预期
+```
+
+不过集成测试会受 BPM 实现细节影响。建议先写纯 Clock 单元测试，再写集成测试。
+
+#### 2.11 常见错误
+
+1. 重复 `Unpin` 导致 `size_` 增加。
+2. `Pin` 没有减少 `size_`。
+3. `Victim` 选中已经 pinned 的 frame。
+4. `Victim` 忘记把选中的 frame 从 replacer 中移除。
+5. hand 没有取模，越界访问 vector。
+6. 所有 ref 都是 1 时只扫描一圈就返回 false。
+7. 没有加锁，导致并发测试不稳定。
+8. 把 `ref` 和 `in_replacer` 混在一起，无法区分“不可淘汰”和“可淘汰但有第二次机会”。
+
+#### 2.12 验收说明
+
+验收时可以这样解释：
+
+```text
+我实现了 Clock Replacer。它用一个环形 hand 扫描 frame，用 reference bit 表示最近访问。Victim 时如果遇到 ref=1 的 frame，就清零并跳过；遇到 ref=0 的候选 frame 才淘汰。因此它是 LRU 的近似实现，维护成本比链表式 LRU 更低。
+```
+
+测试设计可以这样说明：
+
+```text
+我测试了重复 Unpin、Pin 移除、全部 pinned 无 victim、二次机会机制和 hand 环形移动，能够证明 Clock 的核心行为正确。
+```
+
+### 3. Bonus 二：TableHeap / TablePage 优化
+
+#### 3.1 为什么堆表需要优化
+
+当前 TablePage 使用 slotted page 组织记录，基本功能足够，但有一些性能问题。
+
+插入时：
+
+```cpp
+for (i = 0; i < GetTupleCount(); i++) {
+  if (GetTupleSize(i) == 0) break;
+}
+```
+
+也就是说，每次插入都要从 slot 0 开始找空闲 slot。若一个页中 slot 很多，删除了一些记录后，每次插入都可能扫描很多 slot。
+
+遍历时：
+
+```cpp
+GetFirstTupleRid
+GetNextTupleRid
+```
+
+也要顺序扫描 slot，跳过已删除记录。删除越多，扫描无效 slot 的成本越高。
+
+TableHeap 插入时也可能从第一页一路找有空间的页。如果表很大，而大部分页都满了，插入一条记录就可能扫描很多页。
+
+Bonus 的目标就是用额外元信息减少这些扫描。
+
+#### 3.2 可以优化哪些操作
+
+主要优化三个方向：
+
+| 操作 | 原始问题 | 可优化思路 |
+| --- | --- | --- |
+| Row 插入 | 每次在页内扫描空 slot，TableHeap 可能扫描很多页 | 记录可用 slot 或维护有空闲空间的页 |
+| Row 查找 | 根据 RowId 查找较快，但遍历下一条记录要扫描 deleted slot | 记录有效 tuple 数或 next valid slot 信息 |
+| Row 删除 | 删除后只设置 deleted flag，空 slot 复用需要扫描 | 维护 free slot 链表或空闲 slot 计数 |
+
+#### 3.3 TablePage 当前页头布局
+
+当前页头大致是：
+
+```text
+PageId              4 bytes
+LSN                 4 bytes
+PrevPageId          4 bytes
+NextPageId          4 bytes
+FreeSpacePointer    4 bytes
+TupleCount          4 bytes
+Slot array:
+  Tuple offset      4 bytes
+  Tuple size        4 bytes
+```
+
+当前可扩展的位置有两种：
+
+1. 在页头中增加新的元信息字段。
+2. 在 slot size 或 slot offset 中编码额外信息。
+
+推荐第一种，逻辑更清晰。
+
+#### 3.4 推荐优化方案一：记录有效记录数量
+
+新增元信息：
+
+```text
+TupleCount      当前 slot 数量，包括空 slot
+LiveTupleCount  当前有效记录数量，不包括删除记录
+```
+
+作用：
+
+1. 判断页面是否为空更快。
+2. 遍历时如果 `LiveTupleCount == 0`，可以直接跳过整个页面。
+3. 删除、插入后能更清楚地区分“slot 数”和“真实记录数”。
+
+实现建议：
+
+在 `TablePage` 页头增加：
+
+```cpp
+OFFSET_LIVE_TUPLE_COUNT
+GetLiveTupleCount()
+SetLiveTupleCount()
+```
+
+初始化时：
+
+```text
+SetLiveTupleCount(0)
+```
+
+插入成功时：
+
+```text
+LiveTupleCount++
+```
+
+`MarkDelete` 或 `ApplyDelete` 时：
+
+```text
+如果记录从有效变成删除，LiveTupleCount--
+```
+
+`RollbackDelete` 时：
+
+```text
+LiveTupleCount++
+```
+
+注意：如果你的删除分为 `MarkDelete` 和 `ApplyDelete`，要定义清楚 live count 在哪个阶段变化。推荐在 `MarkDelete` 时减少，因为被 mark deleted 的记录对查询和迭代器来说已经不可见。
+
+#### 3.5 推荐优化方案二：维护 free slot 链表
+
+插入时最大的问题是找空 slot 需要从头扫描。
+
+可以在页头增加：
+
+```text
+FirstFreeSlot
+```
+
+表示当前页内第一个可复用 slot。如果没有空 slot，则为 `INVALID_SLOT`。
+
+当某个 slot 被物理删除后，可以把它加入 free slot 链表。
+
+因为每个空 slot 的 offset 和 size 已经无意义，可以复用其中一个字段保存“下一个 free slot”：
+
+```text
+空 slot 的 offset 字段 -> next_free_slot
+空 slot 的 size 字段   -> 0
+```
+
+示例：
+
+```text
+FirstFreeSlot = 3
+slot 3.offset = 7
+slot 7.offset = 9
+slot 9.offset = INVALID_SLOT
+```
+
+插入时：
+
+```text
+if FirstFreeSlot != INVALID_SLOT:
+  使用 FirstFreeSlot
+  FirstFreeSlot = slot[FirstFreeSlot].offset
+else:
+  使用 TupleCount 位置的新 slot
+  TupleCount++
+```
+
+删除时：
+
+```text
+slot[deleted].offset = FirstFreeSlot
+slot[deleted].size = 0
+FirstFreeSlot = deleted
+```
+
+这样插入找空 slot 从 O(slot_count) 变成 O(1)。
+
+#### 3.6 推荐优化方案三：维护页面空闲空间状态
+
+TableHeap 插入时，如果每次都从 first page 开始找空间，会很慢。
+
+可以在 TableHeap 中维护一个“可能有空间的页面集合”：
+
+```cpp
+std::list<page_id_t> free_page_list_;
+```
+
+或：
+
+```cpp
+std::unordered_set<page_id_t> free_page_set_;
+```
+
+含义：
+
+```text
+这些 page 可能可以插入新 Row
+```
+
+插入流程：
+
+```text
+1. 先从 free_page_list_ 取一个候选页。
+2. Fetch 该页，尝试 InsertTuple。
+3. 如果成功：
+   - 如果该页仍有足够空间，保留在 free_page_list_
+   - 如果空间不足，从 free_page_list_ 移除
+4. 如果失败：
+   - 从 free_page_list_ 移除，尝试下一个候选页
+5. 如果没有候选页：
+   - NewPage 创建新 TablePage
+   - 链接到 TableHeap 页链表
+   - 插入记录
+```
+
+难点是“如何知道仍有足够空间”。可以在 TablePage 暴露一个接口：
+
+```cpp
+uint32_t GetFreeSpaceRemaining();
+bool HasEnoughSpace(uint32_t row_size);
+```
+
+当前 `GetFreeSpaceRemaining()` 是 private。为了 TableHeap 优化，可以把它改成 public，或新增 public 包装函数。
+
+#### 3.7 推荐优化方案四：维护最后插入页
+
+如果你不想维护复杂 free page list，可以先做一个简单优化：
+
+```cpp
+page_id_t last_insert_page_id_;
+```
+
+每次插入先尝试上一回成功插入的页：
+
+```text
+1. Fetch last_insert_page_id_
+2. 如果能插入，直接插入
+3. 如果不能，再沿页链表找下一个有空间页
+4. 新建页后更新 last_insert_page_id_
+```
+
+这个方案实现简单，适合 Bonus 初版。
+
+缺点是：如果中间旧页面因为删除产生空间，它不一定能及时利用。可以和 free page list 结合。
+
+#### 3.8 推荐优化方案五：遍历时跳过空页
+
+如果实现了 `LiveTupleCount`，TableIterator 找下一条记录时可以先判断：
+
+```text
+如果当前页 LiveTupleCount == 0:
+  直接跳到 next page
+```
+
+这样删除大量记录后，遍历速度会更好。
+
+如果进一步想优化 slot 内扫描，可以为每个 slot 维护 next valid slot，但这会让删除、插入、更新都复杂很多。课程 Bonus 不建议一上来做这么重。
+
+#### 3.9 页头布局修改注意事项
+
+如果你给 TablePage 增加字段，需要同步修改：
+
+```cpp
+SIZE_TABLE_PAGE_HEADER
+OFFSET_TUPLE_OFFSET
+OFFSET_TUPLE_SIZE
+SIZE_MAX_ROW
+```
+
+例如原来：
+
+```cpp
+SIZE_TABLE_PAGE_HEADER = 24
+OFFSET_TUPLE_OFFSET = 24
+OFFSET_TUPLE_SIZE = 28
+```
+
+如果新增两个 `uint32_t`：
+
+```text
+LiveTupleCount 4 bytes
+FirstFreeSlot  4 bytes
+```
+
+新的头部大小应变为：
+
+```text
+24 + 8 = 32
+```
+
+slot 数组起点也要从 24 改为 32：
+
+```cpp
+OFFSET_TUPLE_OFFSET = 32
+OFFSET_TUPLE_SIZE = 36
+```
+
+否则 slot 会覆盖新增元信息，或者新增元信息会覆盖 slot。
+
+重要提醒：
+
+```text
+修改页格式会影响旧数据库文件兼容性。
+```
+
+如果测试使用旧 db 文件，必须先删除旧文件重新建库。
+
+#### 3.10 TablePage 优化推荐实现顺序
+
+建议分阶段做，不要一次性全部改。
+
+第一阶段：增加 LiveTupleCount。
+
+1. 修改页头布局。
+2. `Init` 中初始化 live count。
+3. `InsertTuple` 成功时 live count++。
+4. `MarkDelete` 成功时 live count--。
+5. `RollbackDelete` 成功时 live count++。
+6. 增加 public `GetLiveTupleCountForTest()` 或类似测试接口，方便验证。
+
+第二阶段：增加 FirstFreeSlot。
+
+1. 页头增加 first free slot。
+2. `Init` 中设置为 invalid。
+3. `ApplyDelete` 后把 slot 加入 free slot 链表。
+4. `InsertTuple` 优先使用 first free slot。
+5. 验证删除后的 slot 会被复用。
+
+第三阶段：优化 TableHeap 插入。
+
+1. 增加 `last_insert_page_id_`，先做简单优化。
+2. 再考虑增加 `free_page_list_`。
+3. 每次删除或物理删除后，如果页面有空间，将 page id 加回 free list。
+4. 每次插入后，如果页面空间不足，将 page id 从 free list 移除。
+
+第四阶段：优化迭代器。
+
+1. 遍历到新页时，如果 live count 为 0，跳过整页。
+2. `GetFirstTupleRid` 和 `GetNextTupleRid` 利用 live count 做快速判断。
+
+#### 3.11 TableHeap 优化测试设计
+
+建议新增：
+
+```text
+test/storage/table_heap_optimized_test.cpp
+```
+
+测试目标一：LiveTupleCount 正确。
+
+```text
+创建表
+插入 10 条
+检查第一页 live count > 0
+删除 3 条
+检查 live count 减少
+RollbackDelete 其中 1 条
+检查 live count 增加
+```
+
+如果不想暴露 live count 接口，也可以通过迭代器数量间接验证。
+
+测试目标二：删除后 slot 复用。
+
+```text
+插入 row1，记录 rid1 = (page, slot)
+ApplyDelete(rid1)
+插入 row2
+期望 row2 的 slot_num == rid1.slot_num
+```
+
+这能证明 free slot 链表起作用。
+
+测试目标三：插入不再总是扫描第一页。
+
+这个测试更偏性能，不容易直接用断言证明。可以设计可观察行为：
+
+```text
+插入大量记录直到产生多页
+删除中间某一页的一些记录
+再次插入
+期望新记录优先进入有空闲空间的旧页，而不是永远追加到最后页
+```
+
+测试目标四：空页遍历跳过。
+
+```text
+插入多页数据
+删除某一整页所有记录
+迭代全表
+确认不会返回删除记录
+确认返回数量正确
+```
+
+测试目标五：基础官方测试仍通过。
+
+```bash
+make table_heap_test -j
+./test/table_heap_test
+```
+
+优化不能破坏原有插入和读取正确性。
+
+#### 3.12 性能验证建议
+
+Bonus 如果想让验收更有说服力，可以写一个简单性能对比测试，但不要把时间断言写得太死。
+
+可以输出统计信息：
+
+```text
+插入 10000 条记录
+优化前扫描 page 次数：xxxx
+优化后扫描 page 次数：yyyy
+```
+
+为了统计扫描次数，可以在 TableHeap 中临时增加调试计数器，或者在测试中构造特定场景观察插入位置。
+
+不建议写：
+
+```cpp
+ASSERT_LT(elapsed_ms, 10);
+```
+
+不同机器性能差异很大，时间断言容易不稳定。
+
+更稳的是检查算法行为：
+
+```text
+删除 slot 后再次插入是否复用 slot
+有空闲页后是否优先使用空闲页
+空页是否被迭代器跳过
+```
+
+#### 3.13 常见错误
+
+1. 增加页头字段后，忘记修改 `SIZE_TABLE_PAGE_HEADER`。
+2. 新的 offset 和 slot 数组重叠，导致记录读写异常。
+3. `LiveTupleCount` 在 MarkDelete、ApplyDelete、RollbackDelete 中重复增减。
+4. 逻辑删除和物理删除阶段没有定义清楚 live count 何时变化。
+5. free slot 链表使用 offset 字段保存 next slot，但插入时忘记恢复 offset。
+6. first free slot 没有更新，导致循环链或丢失空 slot。
+7. TableHeap free page list 中重复加入同一个 page id。
+8. 页面已经满了却仍留在 free page list，导致反复失败。
+9. 删除后页面有空间但没有加入 free page list，导致空间无法复用。
+10. 修改 TablePage 格式后没删除旧数据库文件，测试读到旧格式数据。
+
+#### 3.14 验收说明
+
+验收时可以这样解释：
+
+```text
+我对 TablePage 增加了额外元信息，例如有效记录数和空闲 slot 链表。有效记录数可以让遍历时快速判断页面是否为空；空闲 slot 链表可以让插入时 O(1) 找到可复用 slot，避免每次从头扫描 slot 数组。
+```
+
+如果实现了 TableHeap free page list，可以继续说：
+
+```text
+我在 TableHeap 中维护可能有空闲空间的页面集合。插入时优先从这些页面中选择，而不是总从第一页开始扫描，因此可以减少大表插入时的页面遍历成本。
+```
+
+测试说明：
+
+```text
+我设计了删除后 slot 复用、live count 变化、空页迭代跳过和原有 table_heap_test 回归测试，证明优化没有破坏正确性，并且能减少插入和遍历时的扫描。
+```
+
+### 4. Bonus 推荐完成路线
+
+建议按这个顺序完成 Bonus：
+
+1. 先实现 `ClockReplacer`，不接入 BufferPoolManager。
+2. 编写 `clock_replacer_test.cpp`，证明 Clock 算法行为正确。
+3. 可选：给 BufferPoolManager 增加替换策略参数，验证 Clock 可用于实际缓冲池。
+4. 再优化 TablePage，先增加 `LiveTupleCount`。
+5. 再增加 `FirstFreeSlot`，证明删除 slot 可复用。
+6. 最后优化 TableHeap，加入 `last_insert_page_id_` 或 `free_page_list_`。
+7. 跑回归测试，确保基础实验不被破坏。
+
+建议测试命令：
+
+```bash
+make clock_replacer_test -j
+./test/clock_replacer_test
+
+make table_heap_optimized_test -j
+./test/table_heap_optimized_test
+
+make buffer_pool_manager_test -j
+./test/buffer_pool_manager_test
+
+make table_heap_test -j
+./test/table_heap_test
+
+make minisql_test -j
+./test/minisql_test
+```
+
+如果只做 Clock Replacer，至少需要：
+
+```text
+ClockReplacer 单元测试通过
+LRUReplacer 原测试仍通过
+BufferPoolManager 原测试仍通过
+```
+
+如果做 TableHeap / TablePage 优化，至少需要：
+
+```text
+table_heap_test 原测试仍通过
+新增优化测试通过
+executor_test 中依赖 TableHeap 的 insert/delete/update 仍通过
+```
+
+### 5. Bonus 报告写法建议
+
+实验报告中可以增加一节：
+
+```text
+Bonus 实现
+```
+
+Clock Replacer 可以写：
+
+```text
+在缓冲区替换策略方面，除 LRU 外，我实现了 Clock Replacer。该算法使用环形指针和 reference bit 近似 LRU。Unpin 时将 frame 加入候选集合并设置 reference bit；Pin 时从候选集合移除；Victim 时沿环扫描，对 reference bit 为 1 的 frame 给予第二次机会，对 reference bit 为 0 的 frame 进行淘汰。
+```
+
+TableHeap 优化可以写：
+
+```text
+在堆表优化方面，我为 TablePage 增加了额外元信息，例如有效记录数量和空闲 slot 链表。有效记录数量用于快速判断页面是否含有可见记录，空闲 slot 链表用于删除后 O(1) 复用 slot。同时，在 TableHeap 层维护可插入页面信息，减少插入时从第一页开始线性扫描的成本。
+```
+
+测试可以写：
+
+```text
+针对 Clock Replacer，我设计了重复 Unpin、Pin 移除、二次机会、全部 pinned 和 hand 环形移动测试。针对堆表优化，我设计了删除后 slot 复用、有效记录数变化、空页跳过和原有 TableHeap 回归测试，证明优化后的实现仍保持正确性。
+```
+
+这样写既能说明 Bonus 做了什么，也能说明为什么这样做，以及如何证明它正确。
