@@ -11,6 +11,7 @@ theme:
   name: material
   language: zh
   features:
+    - navigation.tabs
     - navigation.instant
     - navigation.tracking
     - navigation.indexes
@@ -23,15 +24,15 @@ theme:
   palette:
     - media: "(prefers-color-scheme: light)"
       scheme: default
-      primary: indigo
+      primary: green
       accent: teal
       toggle:
         icon: material/weather-night
         name: 切换到深色模式
     - media: "(prefers-color-scheme: dark)"
       scheme: slate
-      primary: indigo
-      accent: teal
+      primary: green
+      accent: green
       toggle:
         icon: material/weather-sunny
         name: 切换到浅色模式
@@ -39,6 +40,7 @@ theme:
 nav:
   - 首页: index.md
   - 课程笔记:
+      - courses/index.md
       - 图像信息处理: courses/image-processing.md
       - 宏观经济学: courses/macroeconomics.md
       - MiniSQL: database/minisql.md
@@ -47,10 +49,12 @@ nav:
       - 计算机体系结构: courses/computer-architecture.md
       - 数据库系统: courses/database-systems.md
   - 工具:
+      - systems-tools/index.md
       - Linux学习: systems-tools/linux.md
       - git使用教程: systems-tools/git.md
       - markdown使用说明: systems-tools/markdown.md
   - 编程语言:
+      - programming/index.md
       - Python学习: programming/python.md
       - HTML学习: programming/html.md
       - 并发编程: programming/concurrency.md
@@ -76,6 +80,9 @@ markdown_extensions:
       smart_enable: all
   - pymdownx.caret
   - pymdownx.details
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
   - pymdownx.highlight:
       anchor_linenums: true
       line_spans: __span
@@ -95,6 +102,7 @@ extra_javascript:
 
 extra_css:
   - stylesheets/toc-collapse.css
+  - stylesheets/theme.css
 
 extra:
   social:
